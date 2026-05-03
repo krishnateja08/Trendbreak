@@ -53,17 +53,17 @@ jobs:
       # 5. Confirm the scanner script is present before running
       - name: Check scanner script exists
         run: |
-          if [ ! -f trendline_scanner_v3.py ]; then
-            echo "❌ trendline_scanner_v3.py not found in repo root!"
+          if [ ! -f trendline_scanner.py ]; then
+            echo "❌ trendline_scanner.py not found in repo root!"
             echo "Make sure you committed the file. Repo contents:"
             ls -la
             exit 1
           fi
-          echo "✅ trendline_scanner_v3.py found"
+          echo "✅ trendline_scanner.py found"
 
       # 6. Run the scanner — generates trendline_breakout_report.html
       - name: Run TrendBreak scanner
-        run: python trendline_scanner_v3.py
+        run: python trendline_scanner.py
 
       # 7. Copy report to docs/index.html  (GitHub Pages serves from /docs)
       - name: Prepare docs folder
