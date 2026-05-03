@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TrendBreak Pro &middot; NSE &amp; NYSE</title>
+<style>
+:root{
+  --nb:#0a1628;--nb2:#0d1f3c;--nb3:#132550;
+  --acc:#2e8fe4;--acc2:#60b8ff;--acc3:#a8dfff;
+  --bdr:rgba(56,163,245,0.25);--bdr2:rgba(56,163,245,0.45);
+  --txt:#e8f2ff;--mu:#8dafc8;--wh:#ffffff;
+  --bu:#34d97b;--be:#f87171;--mx:#fbbf24;
+  --nse:#fbbf24;--nyse:#60b8ff;
+  --mono:'Courier New',Courier,monospace
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--nb);color:var(--txt);font-family:system-ui,sans-serif;font-size:13px;min-height:100vh}
+
+/* ── TOPBAR ── */
+.topbar{background:var(--nb2);border-bottom:1px solid var(--bdr2);padding:7px 16px;
+  display:flex;align-items:center;gap:10px;flex-wrap:wrap;position:sticky;top:0;z-index:100}
+.logo{display:flex;align-items:center;gap:8px}
+.logo-icon{width:26px;height:26px;background:var(--acc);border-radius:5px;
+  display:flex;align-items:center;justify-content:center}
+.logo-icon svg{width:14px;height:14px;fill:none;stroke:#fff;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
+.logo-name{font-weight:700;font-size:14px;color:#fff;letter-spacing:-.2px}
+.logo-sub{font-size:10px;color:var(--acc3);font-family:var(--mono)}
+.vsep{width:1px;height:24px;background:var(--bdr2);flex-shrink:0}
+.tbadge{font-size:10px;font-family:var(--mono);background:rgba(46,143,228,0.1);
+  border:1px solid var(--bdr);color:var(--acc2);border-radius:4px;padding:2px 7px;white-space:nowrap}
+.pulse{display:inline-block;width:5px;height:5px;background:var(--bu);border-radius:50%;
+  margin-right:3px;vertical-align:middle;animation:pulse 1.8s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.topbadges{display:flex;gap:5px;flex-wrap:wrap;margin-left:auto}
+
+/* ── STATS STRIP ── */
+.stats{display:flex;background:rgba(0,0,0,0.3);border-bottom:1px solid var(--bdr);overflow-x:auto}
+.sc{flex:1;min-width:72px;padding:7px 10px;text-align:center;border-right:1px solid var(--bdr)}
+.sc:last-child{border-right:none}
+.sn{font-size:20px;font-weight:700;font-family:var(--mono);line-height:1.1}
+.sl{font-size:9px;color:var(--acc3);text-transform:uppercase;letter-spacing:.5px;margin-top:1px}
+
+/* ── FILTER BAR ── */
+.filterbar{display:flex;align-items:center;gap:6px;padding:8px 14px;
+  background:rgba(0,0,0,0.18);border-bottom:1px solid var(--bdr);flex-wrap:wrap}
+.fb-sep{width:1px;height:20px;background:var(--bdr2);flex-shrink:0;margin:0 2px}
+.btn{padding:4px 13px;border-radius:18px;font-size:11px;font-weight:700;
+  border:1px solid var(--bdr);color:var(--mu);background:transparent;
+  cursor:pointer;font-family:var(--mono);transition:all .15s}
+.btn:hover{border-color:var(--acc2);color:var(--acc2)}
+.btn.on{background:rgba(46,143,228,0.15);color:var(--acc2);border-color:var(--bdr2)}
+.btn.bull-on{background:rgba(52,217,123,0.12);color:var(--bu);border-color:rgba(52,217,123,0.4)}
+.btn.bear-on{background:rgba(248,113,113,0.12);color:var(--be);border-color:rgba(248,113,113,0.4)}
+.tb-sect{background:#0d1f3c;color:var(--mu);border:1px solid var(--bdr);border-radius:4px;
+  padding:3px 8px;font-size:11px;font-family:var(--mono);cursor:pointer;outline:none}
+.tb-sect:focus{border-color:var(--acc2)}
+.result-count{font-size:10px;color:var(--mu);font-family:var(--mono);margin-left:auto}
+
+/* ── SECTOR RSI PANEL ── */
+.srp{background:rgba(0,0,0,0.2);border-bottom:1px solid var(--bdr);padding:8px 14px}
+.srp-title{font-size:9px;color:var(--acc3);text-transform:uppercase;letter-spacing:.5px;
+  margin-bottom:6px;font-family:var(--mono)}
+.srp-tiles{display:flex;flex-wrap:wrap;gap:6px}
+.srp-tile{display:flex;align-items:center;gap:8px;background:rgba(13,31,60,0.7);
+  border:1px solid var(--bdr);border-left:3px solid transparent;
+  border-radius:5px;padding:5px 10px;
+  cursor:pointer;transition:all .18s;white-space:nowrap}
+.srp-tile:hover{background:rgba(46,143,228,0.08);border-color:var(--bdr2)}
+.srp-tile.active{background:rgba(46,143,228,0.14);border-color:var(--acc2)}
+.srp-sname{font-size:10px;font-family:var(--mono);font-weight:700}
+.srp-val{font-size:13px;font-weight:700;font-family:var(--mono)}
+
+/* ── EXCHANGE PANELS ── */
+.panel{display:none;padding:12px 14px 20px}
+.panel.active{display:block}
+
+/* ── CARD GRID ── */
+.card-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(305px,1fr));gap:10px}
+
+/* ── STOCK CARDS ── */
+.card{background:var(--nb2);border:1px solid var(--bdr);border-left:3px solid transparent;
+  border-radius:8px;padding:12px 13px;overflow:hidden;transition:border-color .15s}
+.card:hover{border-color:var(--bdr2)}
+.card.bull{border-left-color:var(--bu)}
+.card.bear{border-left-color:var(--be)}
+.card.mix {border-left-color:var(--mx)}
+
+/* Card header */
+.c-head{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px}
+.c-left{min-width:0}
+.c-ticker{font-family:var(--mono);font-size:15px;font-weight:700;color:#fff;letter-spacing:.3px}
+.c-name{font-size:11px;color:var(--mu);margin-top:2px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:165px}
+.c-right{display:flex;flex-direction:column;align-items:flex-end;gap:4px;flex-shrink:0;margin-left:8px}
+.c-sect{font-size:10px;color:var(--mu);background:rgba(255,255,255,0.05);
+  border:1px solid var(--bdr);padding:1px 7px;border-radius:3px;
+  font-family:var(--mono);white-space:nowrap}
+.c-badge{font-size:11px;font-weight:700;padding:2px 9px;border-radius:10px;
+  font-family:var(--mono);white-space:nowrap}
+.c-badge.bull{background:rgba(52,217,123,0.15);color:var(--bu);border:1px solid rgba(52,217,123,0.35)}
+.c-badge.bear{background:rgba(248,113,113,0.15);color:var(--be);border:1px solid rgba(248,113,113,0.35)}
+.c-badge.mix {background:rgba(251,191,36,0.15);color:var(--mx);border:1px solid rgba(251,191,36,0.35)}
+
+/* Price row */
+.c-prow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;
+  padding:7px 0;border-top:1px solid rgba(56,163,245,0.12);
+  border-bottom:1px solid rgba(56,163,245,0.12);margin-bottom:7px}
+.c-price{font-family:var(--mono);font-size:13px;font-weight:700;color:#fff}
+.c-chg{font-family:var(--mono);font-size:12px;font-weight:700}
+.c-chg.up{color:var(--bu)}.c-chg.dn{color:var(--be)}
+.c-rsi{font-size:10px;padding:2px 6px;border-radius:3px;font-family:var(--mono);
+  background:rgba(240,246,255,0.08);color:#e8f2ff;font-weight:500}
+.c-rsi.bull{background:rgba(52,217,123,0.18);color:var(--bu)}
+.c-rsi.bear{background:rgba(248,113,113,0.18);color:var(--be)}
+.c-rsi.mix{background:rgba(240,246,255,0.1);color:#e8f2ff}
+.c-vol{font-size:10px;color:var(--mu);font-family:var(--mono)}
+.c-vol.vok{color:var(--bu)}
+.c-tl{font-size:10px;color:var(--acc3);font-family:var(--mono)}
+
+/* Signal rows */
+.sig{display:flex;align-items:baseline;gap:5px;padding:3px 0;
+  border-bottom:1px solid rgba(56,163,245,0.08);font-size:11px}
+.sig:last-child{border-bottom:none}
+.sig-n{font-family:var(--mono);font-size:10px;background:rgba(255,255,255,0.06);
+  color:var(--acc3);padding:1px 5px;border-radius:3px;
+  flex-shrink:0;min-width:24px;text-align:center}
+.sig-t{color:var(--txt);flex:1;line-height:1.35}
+.sig-d{flex-shrink:0;font-size:10px;font-weight:700}
+.sig-d.up{color:var(--bu)}.sig-d.dn{color:var(--be)}
+.sig-detail{font-size:10px;color:var(--mu);font-style:italic;
+  padding:1px 0 4px 29px;line-height:1.3}
+
+/* TL Coverage Legend */
+.lgnd{margin:14px 0 0;background:rgba(0,0,0,0.2);border:1px solid var(--bdr);
+  border-radius:7px;padding:10px 12px}
+.lgt{font-size:9px;letter-spacing:.5px;color:var(--acc3);text-transform:uppercase;
+  font-family:var(--mono);margin-bottom:8px}
+.lgg{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:3px}
+.lgi{font-size:10px;display:flex;align-items:center;gap:5px;padding:1px 0}
+.ln{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;
+  background:rgba(96,184,255,0.15);border:1px solid rgba(96,184,255,0.35);border-radius:3px;
+  font-size:9px;font-family:var(--mono);color:var(--acc3);flex-shrink:0;font-weight:700}
+.lhit{background:rgba(52,217,123,0.15);color:var(--bu);
+  border:1px solid rgba(52,217,123,0.35);border-radius:3px;
+  padding:0 5px;font-family:var(--mono);font-size:9px;margin-left:auto}
+
+/* Empty state */
+.empty{text-align:center;color:var(--mu);padding:40px 20px;font-family:var(--mono);font-size:12px}
+
+/* Footer */
+footer{text-align:center;padding:12px;border-top:1px solid var(--bdr);
+  color:var(--mu);font-size:10px;font-family:var(--mono);line-height:2}
+footer a{color:var(--acc2);text-decoration:none}
+
+/* ── LIVE CLOCKS ── */
+.clock-wrap{display:flex;align-items:center;gap:10px;font-family:var(--mono)}
+.clock-item{display:flex;flex-direction:column;align-items:center;gap:1px}
+.clock-time{font-size:12px;font-weight:700;color:var(--acc2);letter-spacing:.5px;white-space:nowrap}
+.clock-lbl{font-size:9px;color:var(--acc3);letter-spacing:.6px;text-transform:uppercase}
+.clock-sep{color:var(--bdr2);font-size:14px;line-height:1}
+
+@media(max-width:600px){
+  .topbar{padding:6px 10px}
+  .panel{padding:8px 8px 14px}
+  .card-grid{grid-template-columns:1fr}
+  .stats .sl{display:none}
+}
+</style></head><body>
+
+<div class="topbar">
+  <div class="logo">
+    <div class="logo-icon">
+      <svg viewBox="0 0 14 14"><polyline points="1,11 4,6 7,8 10,3 13,5"/><line x1="13" y1="1" x2="13" y2="5"/><line x1="13" y1="5" x2="9" y2="5"/></svg>
+    </div>
+    <div>
+      <div class="logo-name">TrendBreak Pro</div>
+      <div class="logo-sub">20 Trendline Types &middot; NSE + NYSE</div>
+    </div>
+  </div>
+  <div class="vsep"></div>
+  <div class="topbadges">
+    <div class="tbadge"><span class="pulse"></span>03 May 2026  19:32:32</div>
+    <div class="tbadge">&#128208; 20 Detectors</div>
+    <div class="tbadge">&#127470;&#127475; NSE &middot; &#127482;&#127480; NYSE</div>
+  </div>
+  <div class="vsep"></div>
+  <div class="clock-wrap">
+    <div class="clock-item">
+      <span id="clk-ist" class="clock-time">--:--:--</span>
+      <span class="clock-lbl">IST</span>
+    </div>
+    <span class="clock-sep">/</span>
+    <div class="clock-item">
+      <span id="clk-est" class="clock-time">--:--:--</span>
+      <span id="clk-est-lbl" class="clock-lbl">EST</span>
+    </div>
+  </div>
+</div>
+
+<div class="stats">
+  <div class="sc"><div class="sn" id="stat-total" style="color:var(--acc2)">109</div><div class="sl">Signals</div></div>
+  <div class="sc"><div class="sn" id="stat-bull"  style="color:var(--bu)">37</div><div class="sl">Bullish</div></div>
+  <div class="sc"><div class="sn" id="stat-bear"  style="color:var(--be)">72</div><div class="sl">Bearish</div></div>
+  <div class="sc"><div class="sn" style="color:var(--nse)">72</div><div class="sl">NSE</div></div>
+  <div class="sc"><div class="sn" style="color:var(--nyse)">37</div><div class="sl">NYSE</div></div>
+  <div class="sc"><div class="sn" id="stat-vol"   style="color:var(--acc3)">28</div><div class="sl">Vol &#10003;</div></div>
+  <div class="sc"><div class="sn" style="color:var(--mu)">149</div><div class="sl">Scanned</div></div>
+  <div class="sc"><div class="sn" style="color:var(--mu)">20</div><div class="sl">TL Types</div></div>
+</div>
+
+<div class="filterbar" id="filterbar">
+  <button class="btn on" id="btn-nse" onclick="switchExch('nse')">&#127470;&#127475; NSE India</button>
+  <button class="btn" id="btn-nyse" onclick="switchExch('nyse')">&#127482;&#127480; NYSE</button>
+  <span class="fb-sep"></span>
+  <button class="btn on" id="btn-all"  onclick="setDir('all')">All</button>
+  <button class="btn" id="btn-bull" onclick="setDir('bull')">&#9650; Bullish</button>
+  <button class="btn" id="btn-bear" onclick="setDir('bear')">&#9660; Bearish</button>
+  <span class="fb-sep"></span>
+  <select class="tb-sect" id="sect-select" onchange="setSect(this.value)">
+    <option value="">All sectors</option>
+  </select>
+  <span class="result-count" id="result-count"></span>
+</div>
+
+<div id="srp-nse"  class="srp"></div>
+<div id="srp-nyse" class="srp" style="display:none"></div>
+
+<div id="panel-nse" class="panel active">
+  <div class="card-grid" id="grid-nse"></div>
+  <div class="lgnd">
+    <div class="lgt">&#128218; Trendline coverage &mdash; NSE</div>
+    <div class="lgg" id="lgnd-nse"></div>
+  </div>
+</div>
+<div id="panel-nyse" class="panel">
+  <div class="card-grid" id="grid-nyse"></div>
+  <div class="lgnd">
+    <div class="lgt">&#128218; Trendline coverage &mdash; NYSE</div>
+    <div class="lgg" id="lgnd-nyse"></div>
+  </div>
+</div>
+
+<footer>
+  &#9888; Educational &amp; research purposes only &middot; Not financial advice &middot; Not SEBI/SEC registered<br>
+  Live data via <a href="https://pypi.org/project/yfinance/">yfinance</a> &middot;
+  Install: <code>pip install yfinance</code> &middot;
+  NSE tickers auto-appended with <code>.NS</code> suffix, BSE fallback <code>.BO</code><br>
+  Generated: 03 May 2026  19:32:32
+</footer>
+
+<script type="application/json" id="data-nse">[{"ticker": "SBIN", "name": "State Bank of India", "sector": "Banking", "exchange": "NSE", "num": "12", "type": "Fibonacci 61.8% Breakdown", "signal": "BEARISH", "price": 1068.45, "change": -1.7, "vol_ratio": 0.8, "vol_ok": false, "rsi": 46.6, "rsi_zone": "Neutral", "srsi": 47.2, "srsi_zone": "Neutral", "tl": 1074.7, "detail": "Price broke below Fib 61.8% support level at 1074.70"}, {"ticker": "SBIN", "name": "State Bank of India", "sector": "Banking", "exchange": "NSE", "num": "10", "type": "EMA20 Dynamic Breakdown", "signal": "BEARISH", "price": 1068.45, "change": -1.7, "vol_ratio": 0.8, "vol_ok": false, "rsi": 46.6, "rsi_zone": "Neutral", "srsi": 47.2, "srsi_zone": "Neutral", "tl": 1081.29, "detail": "Price fell below EMA20 dynamic trendline — bearish momentum"}, {"ticker": "SBIN", "name": "State Bank of India", "sector": "Banking", "exchange": "NSE", "num": "10", "type": "EMA50 Dynamic Breakdown", "signal": "BEARISH", "price": 1068.45, "change": -1.7, "vol_ratio": 0.8, "vol_ok": false, "rsi": 46.6, "rsi_zone": "Neutral", "srsi": 47.2, "srsi_zone": "Neutral", "tl": 1079.82, "detail": "Price fell below EMA50 dynamic trendline — bearish momentum"}, {"ticker": "AXISBANK", "name": "Axis Bank", "sector": "Banking", "exchange": "NSE", "num": "12", "type": "Fibonacci 50.0% Breakdown", "signal": "BEARISH", "price": 1268.3, "change": -2.17, "vol_ratio": 2.2, "vol_ok": true, "rsi": 42.2, "rsi_zone": "Neutral", "srsi": 47.2, "srsi_zone": "Neutral", "tl": 1284.3, "detail": "Price broke below Fib 50.0% support level at 1284.30"}, {"ticker": "PNB", "name": "Punjab National Bank", "sector": "Banking", "exchange": "NSE", "num": "18", "type": "Speed Resistance 2/3 Line Break", "signal": "BEARISH", "price": 109.36, "change": -1.64, "vol_ratio": 0.9, "vol_ok": false, "rsi": 43.3, "rsi_zone": "Neutral", "srsi": 47.2, "srsi_zone": "Neutral", "tl": 110.77, "detail": "Broke below 2/3 Speed Resistance Line at 110.77 — major support lost"}, {"ticker": "MUTHOOTFIN", "name": "Muthoot Finance", "sector": "Fin. Services", "exchange": "NSE", "num": "10", "type": "EMA20 Dynamic Breakdown", "signal": "BEARISH", "price": 3424.2, "change": -1.07, "vol_ratio": 0.7, "vol_ok": false, "rsi": 48.1, "rsi_zone": "Neutral", "srsi": 48.1, "srsi_zone": "Neutral", "tl": 3462.32, "detail": "Price fell below EMA20 dynamic trendline — bearish momentum"}, {"ticker": "MUTHOOTFIN", "name": "Muthoot Finance", "sector": "Fin. Services", "exchange": "NSE", "num": "10", "type": "EMA50 Dynamic Breakdown", "signal": "BEARISH", "price": 3424.2, "change": -1.07, "vol_ratio": 0.7, "vol_ok": false, "rsi": 48.1, "rsi_zone": "Neutral", "srsi": 48.1, "srsi_zone": "Neutral", "tl": 3456.6, "detail": "Price fell below EMA50 dynamic trendline — bearish momentum"}, {"ticker": "SHRIRAMFIN", "name": "Shriram Finance", "sector": "Fin. Services", "exchange": "NSE", "num": "18", "type": "Speed Resistance 2/3 Line Break", "signal": "BEARISH", "price": 937.35, "change": -2.04, "vol_ratio": 0.8, "vol_ok": false, "rsi": 40.7, "rsi_zone": "Neutral", "srsi": 48.1, "srsi_zone": "Neutral", "tl": 944.97, "detail": "Broke below 2/3 Speed Resistance Line at 944.97 — major support lost"}, {"ticker": "TATACAP", "name": "Tata Capital", "sector": "Fin. Services", "exchange": "NSE", "num": "4", "type": "Descending Channel Breakout", "signal": "BULLISH", "price": 333.15, "change": 2.48, "vol_ratio": 0.9, "vol_ok": false, "rsi": 54.1, "rsi_zone": "Neutral", "srsi": 48.1, "srsi_zone": "Neutral", "tl": 328.0, "detail": "Broke above upper descending channel resistance"}, {"ticker": "TATACAP", "name": "Tata Capital", "sector": "Fin. Services", "exchange": "NSE", "num": "5", "type": "Symmetrical Triangle Breakout", "signal": "BULLISH", "price": 333.15, "change": 2.48, "vol_ratio": 0.9, "vol_ok": false, "rsi": 54.1, "rsi_zone": "Neutral", "srsi": 48.1, "srsi_zone": "Neutral", "tl": 328.0, "detail": "Explosive breakout from compressed symmetrical triangle"}, {"ticker": "TATACAP", "name": "Tata Capital", "sector": "Fin. Services", "exchange": "NSE", "num": "12", "type": "Fibonacci 50.0% Breakout", "signal": "BULLISH", "price": 333.15, "change": 2.48, "vol_ratio": 0.9, "vol_ok": false, "rsi": 54.1, "rsi_zone": "Neutral", "srsi": 48.1, "srsi_zone": "Neutral", "tl": 329.52, "detail": "Price broke above Fib 50.0% retracement level at 329.52"}, {"ticker": "TATACAP", "name": "Tata Capital", "sector": "Fin. Services", "exchange": "NSE", "num": "10", "type": "EMA20 Dynamic Breakout", "signal": "BULLISH", "price": 333.15, "change": 2.48, "vol_ratio": 0.9, "vol_ok": false, "rsi": 54.1, "rsi_zone": "Neutral", "srsi": 48.1, "srsi_zone": "Neutral", "tl": 329.09, "detail": "Price crossed above EMA20 dynamic trendline — bullish momentum"}, {"ticker": "TATACAP", "name": "Tata Capital", "sector": "Fin. Services", "exchange": "NSE", "num": "10", "type": "EMA50 Dynamic Breakout", "signal": "BULLISH", "price": 333.15, "change": 2.48, "vol_ratio": 0.9, "vol_ok": false, "rsi": 54.1, "rsi_zone": "Neutral", "srsi": 48.1, "srsi_zone": "Neutral", "tl": 329.13, "detail": "Price crossed above EMA50 dynamic trendline — bullish momentum"}, {"ticker": "PFC", "name": "Power Finance Corp", "sector": "Fin. Services", "exchange": "NSE", "num": "12", "type": "Fibonacci 23.6% Breakdown", "signal": "BEARISH", "price": 448.4, "change": -3.52, "vol_ratio": 1.0, "vol_ok": false, "rsi": 52.8, "rsi_zone": "Neutral", "srsi": 48.1, "srsi_zone": "Neutral", "tl": 457.39, "detail": "Price broke below Fib 23.6% support level at 457.39"}, {"ticker": "RECLTD", "name": "REC Limited", "sector": "Fin. Services", "exchange": "NSE", "num": "18", "type": "Speed Resistance 1/3 Line Break", "signal": "BEARISH", "price": 354.3, "change": -2.54, "vol_ratio": 1.0, "vol_ok": false, "rsi": 48.6, "rsi_zone": "Neutral", "srsi": 48.1, "srsi_zone": "Neutral", "tl": 359.65, "detail": "Broke below 1/3 Speed Resistance Line at 359.65 — correction deepening"}, {"ticker": "RECLTD", "name": "REC Limited", "sector": "Fin. Services", "exchange": "NSE", "num": "20", "type": "Gann 1×1 Angle Breakdown (45°)", "signal": "BEARISH", "price": 354.3, "change": -2.54, "vol_ratio": 1.0, "vol_ok": false, "rsi": 48.6, "rsi_zone": "Neutral", "srsi": 48.1, "srsi_zone": "Neutral", "tl": 364.86, "detail": "Price fell below Gann 1×1 angle (45°) from origin 304.05 — trend weakening"}, {"ticker": "RECLTD", "name": "REC Limited", "sector": "Fin. Services", "exchange": "NSE", "num": "10", "type": "EMA20 Dynamic Breakdown", "signal": "BEARISH", "price": 354.3, "change": -2.54, "vol_ratio": 1.0, "vol_ok": false, "rsi": 48.6, "rsi_zone": "Neutral", "srsi": 48.1, "srsi_zone": "Neutral", "tl": 360.18, "detail": "Price fell below EMA20 dynamic trendline — bearish momentum"}, {"ticker": "HDFCAMC", "name": "HDFC AMC", "sector": "Fin. Services", "exchange": "NSE", "num": "12", "type": "Fibonacci 23.6% Breakdown", "signal": "BEARISH", "price": 2712.6, "change": -2.7, "vol_ratio": 0.9, "vol_ok": false, "rsi": 56.0, "rsi_zone": "Neutral", "srsi": 48.1, "srsi_zone": "Neutral", "tl": 2737.27, "detail": "Price broke below Fib 23.6% support level at 2737.27"}, {"ticker": "BAJAJHLDNG", "name": "Bajaj Holdings", "sector": "Fin. Services", "exchange": "NSE", "num": "17", "type": "Role Reversal — Old Support Now Resistance", "signal": "BEARISH", "price": 10267.0, "change": -0.37, "vol_ratio": 0.6, "vol_ok": false, "rsi": 55.4, "rsi_zone": "Neutral", "srsi": 48.1, "srsi_zone": "Neutral", "tl": 10400.0, "detail": "Polarity flip: old support 10400.00 now acting as resistance → bearish continuation"}, {"ticker": "GAIL", "name": "GAIL India", "sector": "Energy", "exchange": "NSE", "num": "20", "type": "Gann 1×1 Angle Breakdown (45°)", "signal": "BEARISH", "price": 163.23, "change": -1.47, "vol_ratio": 0.6, "vol_ok": false, "rsi": 61.7, "rsi_zone": "Strong", "srsi": 78.8, "srsi_zone": "OB", "tl": 166.61, "detail": "Price fell below Gann 1×1 angle (45°) from origin 134.36 — trend weakening"}, {"ticker": "BAJAJ-AUTO", "name": "Bajaj Auto", "sector": "Auto", "exchange": "NSE", "num": "9", "type": "Internal Trendline Breakout (Up)", "signal": "BULLISH", "price": 9994.0, "change": 4.72, "vol_ratio": 2.9, "vol_ok": true, "rsi": 62.9, "rsi_zone": "Strong", "srsi": 51.6, "srsi_zone": "Neutral", "tl": 9659.01, "detail": "Broke above internal mid-body regression line — momentum shift up"}, {"ticker": "BAJAJ-AUTO", "name": "Bajaj Auto", "sector": "Auto", "exchange": "NSE", "num": "12", "type": "Fibonacci 23.6% Breakout", "signal": "BULLISH", "price": 9994.0, "change": 4.72, "vol_ratio": 2.9, "vol_ok": true, "rsi": 62.9, "rsi_zone": "Strong", "srsi": 51.6, "srsi_zone": "Neutral", "tl": 9818.13, "detail": "Price broke above Fib 23.6% retracement level at 9818.13"}, {"ticker": "BAJAJ-AUTO", "name": "Bajaj Auto", "sector": "Auto", "exchange": "NSE", "num": "18", "type": "Speed Resistance 1/3 Line Recovery", "signal": "BULLISH", "price": 9994.0, "change": 4.72, "vol_ratio": 2.9, "vol_ok": true, "rsi": 62.9, "rsi_zone": "Strong", "srsi": 51.6, "srsi_zone": "Neutral", "tl": 9666.0, "detail": "Recovered above 1/3 Speed Resistance Line at 9666.00 — trend resuming"}, {"ticker": "BAJAJ-AUTO", "name": "Bajaj Auto", "sector": "Auto", "exchange": "NSE", "num": "19", "type": "Body Trendline Breakout (No-Wick)", "signal": "BULLISH", "price": 9994.0, "change": 4.72, "vol_ratio": 2.9, "vol_ok": true, "rsi": 62.9, "rsi_zone": "Strong", "srsi": 51.6, "srsi_zone": "Neutral", "tl": 9808.57, "detail": "Broke above candle-body downtrend line (wick-filtered) at 9808.57"}, {"ticker": "M&M", "name": "Mahindra & Mahindra", "sector": "Auto", "exchange": "NSE", "num": "10", "type": "EMA20 Dynamic Breakdown", "signal": "BEARISH", "price": 3097.5, "change": -1.74, "vol_ratio": 1.1, "vol_ok": false, "rsi": 46.5, "rsi_zone": "Neutral", "srsi": 51.6, "srsi_zone": "Neutral", "tl": 3136.6, "detail": "Price fell below EMA20 dynamic trendline — bearish momentum"}, {"ticker": "EICHERMOT", "name": "Eicher Motors", "sector": "Auto", "exchange": "NSE", "num": "10", "type": "EMA50 Dynamic Breakdown", "signal": "BEARISH", "price": 7109.0, "change": -1.12, "vol_ratio": 0.8, "vol_ok": false, "rsi": 49.6, "rsi_zone": "Neutral", "srsi": 51.6, "srsi_zone": "Neutral", "tl": 7169.62, "detail": "Price fell below EMA50 dynamic trendline — bearish momentum"}, {"ticker": "TVSMOTOR", "name": "TVS Motor", "sector": "Auto", "exchange": "NSE", "num": "12", "type": "Fibonacci 61.8% Breakdown", "signal": "BEARISH", "price": 3492.9, "change": -1.72, "vol_ratio": 1.1, "vol_ok": false, "rsi": 43.8, "rsi_zone": "Neutral", "srsi": 51.6, "srsi_zone": "Neutral", "tl": 3532.65, "detail": "Price broke below Fib 61.8% support level at 3532.65"}, {"ticker": "MOTHERSON", "name": "Samvardhana Motherson", "sector": "Auto", "exchange": "NSE", "num": "9", "type": "Internal Trendline Breakdown (Down)", "signal": "BEARISH", "price": 121.21, "change": -1.65, "vol_ratio": 0.7, "vol_ok": false, "rsi": 50.0, "rsi_zone": "Neutral", "srsi": 51.6, "srsi_zone": "Neutral", "tl": 123.52, "detail": "Broke below internal mid-body regression line — momentum shift down"}, {"ticker": "BOSCHLTD", "name": "Bosch", "sector": "Auto", "exchange": "NSE", "num": "12", "type": "Fibonacci 23.6% Breakdown", "signal": "BEARISH", "price": 35995.0, "change": -0.96, "vol_ratio": 0.5, "vol_ok": false, "rsi": 52.9, "rsi_zone": "Neutral", "srsi": 51.6, "srsi_zone": "Neutral", "tl": 36257.64, "detail": "Price broke below Fib 23.6% support level at 36257.64"}, {"ticker": "SUNPHARMA", "name": "Sun Pharma", "sector": "Pharma", "exchange": "NSE", "num": "2", "type": "Downtrend Line Breakout", "signal": "BULLISH", "price": 1808.3, "change": 1.66, "vol_ratio": 0.8, "vol_ok": false, "rsi": 63.1, "rsi_zone": "Strong", "srsi": 65.8, "srsi_zone": "Strong", "tl": 1773.18, "detail": "Broke above descending lower-highs trendline → bullish reversal"}, {"ticker": "ZYDUSLIFE", "name": "Zydus Lifesciences", "sector": "Pharma", "exchange": "NSE", "num": "12", "type": "Fibonacci 50.0% Breakdown", "signal": "BEARISH", "price": 891.9, "change": -2.08, "vol_ratio": 1.3, "vol_ok": false, "rsi": 43.3, "rsi_zone": "Neutral", "srsi": 65.8, "srsi_zone": "Strong", "tl": 899.2, "detail": "Price broke below Fib 50.0% support level at 899.20"}, {"ticker": "ZYDUSLIFE", "name": "Zydus Lifesciences", "sector": "Pharma", "exchange": "NSE", "num": "10", "type": "EMA50 Dynamic Breakdown", "signal": "BEARISH", "price": 891.9, "change": -2.08, "vol_ratio": 1.3, "vol_ok": false, "rsi": 43.3, "rsi_zone": "Neutral", "srsi": 65.8, "srsi_zone": "Strong", "tl": 909.57, "detail": "Price fell below EMA50 dynamic trendline — bearish momentum"}, {"ticker": "MAXHEALTH", "name": "Max Healthcare", "sector": "Pharma", "exchange": "NSE", "num": "10", "type": "EMA50 Dynamic Breakdown", "signal": "BEARISH", "price": 993.05, "change": -1.35, "vol_ratio": 1.0, "vol_ok": false, "rsi": 49.6, "rsi_zone": "Neutral", "srsi": 65.8, "srsi_zone": "Strong", "tl": 1003.31, "detail": "Price fell below EMA50 dynamic trendline — bearish momentum"}, {"ticker": "VEDL", "name": "Vedanta", "sector": "Metals", "exchange": "NSE", "num": "3", "type": "Horizontal Support Breakdown", "signal": "BEARISH", "price": 271.55, "change": -64.9, "vol_ratio": 3.2, "vol_ok": true, "rsi": 16.6, "rsi_zone": "OS", "srsi": 62.6, "srsi_zone": "Strong", "tl": 633.44, "detail": "Broke below key flat support floor at 633.44"}, {"ticker": "VEDL", "name": "Vedanta", "sector": "Metals", "exchange": "NSE", "num": "4", "type": "Descending Channel Breakdown", "signal": "BEARISH", "price": 271.55, "change": -64.9, "vol_ratio": 3.2, "vol_ok": true, "rsi": 16.6, "rsi_zone": "OS", "srsi": 62.6, "srsi_zone": "Strong", "tl": 597.1, "detail": "Broke below lower descending channel support"}, {"ticker": "VEDL", "name": "Vedanta", "sector": "Metals", "exchange": "NSE", "num": "5", "type": "Symmetrical Triangle Breakdown", "signal": "BEARISH", "price": 271.55, "change": -64.9, "vol_ratio": 3.2, "vol_ok": true, "rsi": 16.6, "rsi_zone": "OS", "srsi": 62.6, "srsi_zone": "Strong", "tl": 597.1, "detail": "Broke down from symmetrical triangle pattern"}, {"ticker": "VEDL", "name": "Vedanta", "sector": "Metals", "exchange": "NSE", "num": "8", "type": "Fan Line 3rd Break (Major)", "signal": "BEARISH", "price": 271.55, "change": -64.9, "vol_ratio": 3.2, "vol_ok": true, "rsi": 16.6, "rsi_zone": "OS", "srsi": 62.6, "srsi_zone": "Strong", "tl": 664.26, "detail": "All 3 fan lines broken — major trend exhaustion and reversal confirmed"}, {"ticker": "VEDL", "name": "Vedanta", "sector": "Metals", "exchange": "NSE", "num": "9", "type": "Internal Trendline Breakdown (Down)", "signal": "BEARISH", "price": 271.55, "change": -64.9, "vol_ratio": 3.2, "vol_ok": true, "rsi": 16.6, "rsi_zone": "OS", "srsi": 62.6, "srsi_zone": "Strong", "tl": 752.07, "detail": "Broke below internal mid-body regression line — momentum shift down"}, {"ticker": "VEDL", "name": "Vedanta", "sector": "Metals", "exchange": "NSE", "num": "12", "type": "Fibonacci 23.6% Breakdown", "signal": "BEARISH", "price": 271.55, "change": -64.9, "vol_ratio": 3.2, "vol_ok": true, "rsi": 16.6, "rsi_zone": "OS", "srsi": 62.6, "srsi_zone": "Strong", "tl": 670.79, "detail": "Price broke below Fib 23.6% support level at 670.79"}, {"ticker": "VEDL", "name": "Vedanta", "sector": "Metals", "exchange": "NSE", "num": "13", "type": "Pitchfork Median Line Breakdown", "signal": "BEARISH", "price": 271.55, "change": -64.9, "vol_ratio": 3.2, "vol_ok": true, "rsi": 16.6, "rsi_zone": "OS", "srsi": 62.6, "srsi_zone": "Strong", "tl": 448.21, "detail": "Price broke below Andrews Pitchfork median line — bearish shift"}, {"ticker": "VEDL", "name": "Vedanta", "sector": "Metals", "exchange": "NSE", "num": "14", "type": "Regression Channel Lower Breakdown", "signal": "BEARISH", "price": 271.55, "change": -64.9, "vol_ratio": 3.2, "vol_ok": true, "rsi": 16.6, "rsi_zone": "OS", "srsi": 62.6, "srsi_zone": "Strong", "tl": 567.21, "detail": "Price broke below 2σ lower regression band — mean reversion exhausted"}, {"ticker": "VEDL", "name": "Vedanta", "sector": "Metals", "exchange": "NSE", "num": "18", "type": "Speed Resistance 1/3 Line Break", "signal": "BEARISH", "price": 271.55, "change": -64.9, "vol_ratio": 3.2, "vol_ok": true, "rsi": 16.6, "rsi_zone": "OS", "srsi": 62.6, "srsi_zone": "Strong", "tl": 619.57, "detail": "Broke below 1/3 Speed Resistance Line at 619.57 — correction deepening"}, {"ticker": "VEDL", "name": "Vedanta", "sector": "Metals", "exchange": "NSE", "num": "20", "type": "Gann 1×1 Angle Breakdown (45°)", "signal": "BEARISH", "price": 271.55, "change": -64.9, "vol_ratio": 3.2, "vol_ok": true, "rsi": 16.6, "rsi_zone": "OS", "srsi": 62.6, "srsi_zone": "Strong", "tl": 773.55, "detail": "Price fell below Gann 1×1 angle (45°) from origin 623.83 — trend weakening"}, {"ticker": "VEDL", "name": "Vedanta", "sector": "Metals", "exchange": "NSE", "num": "10", "type": "EMA20 Dynamic Breakdown", "signal": "BEARISH", "price": 271.55, "change": -64.9, "vol_ratio": 3.2, "vol_ok": true, "rsi": 16.6, "rsi_zone": "OS", "srsi": 62.6, "srsi_zone": "Strong", "tl": 691.96, "detail": "Price fell below EMA20 dynamic trendline — bearish momentum"}, {"ticker": "VEDL", "name": "Vedanta", "sector": "Metals", "exchange": "NSE", "num": "10", "type": "EMA50 Dynamic Breakdown", "signal": "BEARISH", "price": 271.55, "change": -64.9, "vol_ratio": 3.2, "vol_ok": true, "rsi": 16.6, "rsi_zone": "OS", "srsi": 62.6, "srsi_zone": "Strong", "tl": 688.21, "detail": "Price fell below EMA50 dynamic trendline — bearish momentum"}, {"ticker": "HINDZINC", "name": "Hindustan Zinc", "sector": "Metals", "exchange": "NSE", "num": "12", "type": "Fibonacci 38.2% Breakdown", "signal": "BEARISH", "price": 595.95, "change": -1.01, "vol_ratio": 1.0, "vol_ok": false, "rsi": 58.9, "rsi_zone": "Neutral", "srsi": 62.6, "srsi_zone": "Strong", "tl": 600.34, "detail": "Price broke below Fib 38.2% support level at 600.34"}, {"ticker": "HINDUNILVR", "name": "Hindustan Unilever", "sector": "FMCG", "exchange": "NSE", "num": "11", "type": "H&S Neckline Breakdown", "signal": "BEARISH", "price": 2250.9, "change": -2.74, "vol_ratio": 1.8, "vol_ok": true, "rsi": 52.2, "rsi_zone": "Neutral", "srsi": 61.9, "srsi_zone": "Strong", "tl": 2303.0, "detail": "Classic Head & Shoulders — neckline at 2303.00 broken downward"}, {"ticker": "HINDUNILVR", "name": "Hindustan Unilever", "sector": "FMCG", "exchange": "NSE", "num": "12", "type": "Fibonacci 38.2% Breakdown", "signal": "BEARISH", "price": 2250.9, "change": -2.74, "vol_ratio": 1.8, "vol_ok": true, "rsi": 52.2, "rsi_zone": "Neutral", "srsi": 61.9, "srsi_zone": "Strong", "tl": 2304.99, "detail": "Price broke below Fib 38.2% support level at 2304.99"}, {"ticker": "TATACONSUM", "name": "Tata Consumer Products", "sector": "FMCG", "exchange": "NSE", "num": "12", "type": "Fibonacci 23.6% Breakdown", "signal": "BEARISH", "price": 1144.6, "change": -2.0, "vol_ratio": 0.9, "vol_ok": false, "rsi": 56.6, "rsi_zone": "Neutral", "srsi": 61.9, "srsi_zone": "Strong", "tl": 1152.21, "detail": "Price broke below Fib 23.6% support level at 1152.21"}, {"ticker": "GODREJCP", "name": "Godrej Consumer Products", "sector": "FMCG", "exchange": "NSE", "num": "10", "type": "EMA20 Dynamic Breakdown", "signal": "BEARISH", "price": 1067.1, "change": -2.11, "vol_ratio": 1.1, "vol_ok": false, "rsi": 45.7, "rsi_zone": "Neutral", "srsi": 61.9, "srsi_zone": "Strong", "tl": 1084.85, "detail": "Price fell below EMA20 dynamic trendline — bearish momentum"}, {"ticker": "UNITDSPR", "name": "United Spirits", "sector": "FMCG", "exchange": "NSE", "num": "12", "type": "Fibonacci 38.2% Breakdown", "signal": "BEARISH", "price": 1325.6, "change": -2.77, "vol_ratio": 0.8, "vol_ok": false, "rsi": 50.1, "rsi_zone": "Neutral", "srsi": 61.9, "srsi_zone": "Strong", "tl": 1347.07, "detail": "Price broke below Fib 38.2% support level at 1347.07"}, {"ticker": "UNITDSPR", "name": "United Spirits", "sector": "FMCG", "exchange": "NSE", "num": "18", "type": "Speed Resistance 1/3 Line Break", "signal": "BEARISH", "price": 1325.6, "change": -2.77, "vol_ratio": 0.8, "vol_ok": false, "rsi": 50.1, "rsi_zone": "Neutral", "srsi": 61.9, "srsi_zone": "Strong", "tl": 1357.8, "detail": "Broke below 1/3 Speed Resistance Line at 1357.80 — correction deepening"}, {"ticker": "LT", "name": "Larsen & Toubro", "sector": "Infra/Defence", "exchange": "NSE", "num": "18", "type": "Speed Resistance 1/3 Line Break", "signal": "BEARISH", "price": 4014.0, "change": -2.0, "vol_ratio": 0.8, "vol_ok": false, "rsi": 54.2, "rsi_zone": "Neutral", "srsi": 62.0, "srsi_zone": "Strong", "tl": 4056.03, "detail": "Broke below 1/3 Speed Resistance Line at 4056.03 — correction deepening"}, {"ticker": "LT", "name": "Larsen & Toubro", "sector": "Infra/Defence", "exchange": "NSE", "num": "20", "type": "Gann 1×1 Angle Breakdown (45°)", "signal": "BEARISH", "price": 4014.0, "change": -2.0, "vol_ratio": 0.8, "vol_ok": false, "rsi": 54.2, "rsi_zone": "Neutral", "srsi": 62.0, "srsi_zone": "Strong", "tl": 4077.24, "detail": "Price fell below Gann 1×1 angle (45°) from origin 3288.10 — trend weakening"}, {"ticker": "BEL", "name": "Bharat Electronics", "sector": "Infra/Defence", "exchange": "NSE", "num": "12", "type": "Fibonacci 50.0% Breakdown", "signal": "BEARISH", "price": 431.3, "change": -1.43, "vol_ratio": 1.1, "vol_ok": false, "rsi": 44.4, "rsi_zone": "Neutral", "srsi": 62.0, "srsi_zone": "Strong", "tl": 436.4, "detail": "Price broke below Fib 50.0% support level at 436.40"}, {"ticker": "BEL", "name": "Bharat Electronics", "sector": "Infra/Defence", "exchange": "NSE", "num": "10", "type": "EMA50 Dynamic Breakdown", "signal": "BEARISH", "price": 431.3, "change": -1.43, "vol_ratio": 1.1, "vol_ok": false, "rsi": 44.4, "rsi_zone": "Neutral", "srsi": 62.0, "srsi_zone": "Strong", "tl": 436.11, "detail": "Price fell below EMA50 dynamic trendline — bearish momentum"}, {"ticker": "ULTRACEMCO", "name": "UltraTech Cement", "sector": "Cons. Goods", "exchange": "NSE", "num": "9", "type": "Internal Trendline Breakdown (Down)", "signal": "BEARISH", "price": 11586.0, "change": -2.09, "vol_ratio": 1.9, "vol_ok": true, "rsi": 47.4, "rsi_zone": "Neutral", "srsi": 57.3, "srsi_zone": "Neutral", "tl": 11858.39, "detail": "Broke below internal mid-body regression line — momentum shift down"}, {"ticker": "ULTRACEMCO", "name": "UltraTech Cement", "sector": "Cons. Goods", "exchange": "NSE", "num": "12", "type": "Fibonacci 50.0% Breakdown", "signal": "BEARISH", "price": 11586.0, "change": -2.09, "vol_ratio": 1.9, "vol_ok": true, "rsi": 47.4, "rsi_zone": "Neutral", "srsi": 57.3, "srsi_zone": "Neutral", "tl": 11717.5, "detail": "Price broke below Fib 50.0% support level at 11717.50"}, {"ticker": "ULTRACEMCO", "name": "UltraTech Cement", "sector": "Cons. Goods", "exchange": "NSE", "num": "10", "type": "EMA20 Dynamic Breakdown", "signal": "BEARISH", "price": 11586.0, "change": -2.09, "vol_ratio": 1.9, "vol_ok": true, "rsi": 47.4, "rsi_zone": "Neutral", "srsi": 57.3, "srsi_zone": "Neutral", "tl": 11718.27, "detail": "Price fell below EMA20 dynamic trendline — bearish momentum"}, {"ticker": "ULTRACEMCO", "name": "UltraTech Cement", "sector": "Cons. Goods", "exchange": "NSE", "num": "10", "type": "EMA50 Dynamic Breakdown", "signal": "BEARISH", "price": 11586.0, "change": -2.09, "vol_ratio": 1.9, "vol_ok": true, "rsi": 47.4, "rsi_zone": "Neutral", "srsi": 57.3, "srsi_zone": "Neutral", "tl": 11746.7, "detail": "Price fell below EMA50 dynamic trendline — bearish momentum"}, {"ticker": "AMBUJACEM", "name": "Ambuja Cements", "sector": "Cons. Goods", "exchange": "NSE", "num": "12", "type": "Fibonacci 61.8% Breakdown", "signal": "BEARISH", "price": 444.2, "change": -2.29, "vol_ratio": 1.1, "vol_ok": false, "rsi": 47.0, "rsi_zone": "Neutral", "srsi": 57.3, "srsi_zone": "Neutral", "tl": 452.45, "detail": "Price broke below Fib 61.8% support level at 452.45"}, {"ticker": "AMBUJACEM", "name": "Ambuja Cements", "sector": "Cons. Goods", "exchange": "NSE", "num": "10", "type": "EMA20 Dynamic Breakdown", "signal": "BEARISH", "price": 444.2, "change": -2.29, "vol_ratio": 1.1, "vol_ok": false, "rsi": 47.0, "rsi_zone": "Neutral", "srsi": 57.3, "srsi_zone": "Neutral", "tl": 449.22, "detail": "Price fell below EMA20 dynamic trendline — bearish momentum"}, {"ticker": "SHREECEM", "name": "Shree Cement", "sector": "Cons. Goods", "exchange": "NSE", "num": "12", "type": "Fibonacci 61.8% Breakdown", "signal": "BEARISH", "price": 24195.0, "change": -1.47, "vol_ratio": 0.9, "vol_ok": false, "rsi": 44.4, "rsi_zone": "Neutral", "srsi": 57.3, "srsi_zone": "Neutral", "tl": 24458.09, "detail": "Price broke below Fib 61.8% support level at 24458.09"}, {"ticker": "PIDILITIND", "name": "Pidilite Industries", "sector": "Cons. Goods", "exchange": "NSE", "num": "17", "type": "Role Reversal — Old Support Now Resistance", "signal": "BEARISH", "price": 1375.7, "change": -0.96, "vol_ratio": 1.4, "vol_ok": false, "rsi": 50.1, "rsi_zone": "Neutral", "srsi": 57.3, "srsi_zone": "Neutral", "tl": 1398.8, "detail": "Polarity flip: old support 1398.80 now acting as resistance → bearish continuation"}, {"ticker": "PIDILITIND", "name": "Pidilite Industries", "sector": "Cons. Goods", "exchange": "NSE", "num": "10", "type": "EMA50 Dynamic Breakdown", "signal": "BEARISH", "price": 1375.7, "change": -0.96, "vol_ratio": 1.4, "vol_ok": false, "rsi": 50.1, "rsi_zone": "Neutral", "srsi": 57.3, "srsi_zone": "Neutral", "tl": 1388.35, "detail": "Price fell below EMA50 dynamic trendline — bearish momentum"}, {"ticker": "TRENT", "name": "Trent", "sector": "Cons. Goods", "exchange": "NSE", "num": "12", "type": "Fibonacci 23.6% Breakdown", "signal": "BEARISH", "price": 4144.6, "change": -1.98, "vol_ratio": 0.3, "vol_ok": false, "rsi": 56.2, "rsi_zone": "Neutral", "srsi": 57.3, "srsi_zone": "Neutral", "tl": 4209.49, "detail": "Price broke below Fib 23.6% support level at 4209.49"}, {"ticker": "INDHOTEL", "name": "Indian Hotels", "sector": "Cons. Goods", "exchange": "NSE", "num": "12", "type": "Fibonacci 50.0% Breakdown", "signal": "BEARISH", "price": 635.85, "change": -1.37, "vol_ratio": 0.6, "vol_ok": false, "rsi": 49.1, "rsi_zone": "Neutral", "srsi": 57.3, "srsi_zone": "Neutral", "tl": 639.45, "detail": "Price broke below Fib 50.0% support level at 639.45"}, {"ticker": "INDHOTEL", "name": "Indian Hotels", "sector": "Cons. Goods", "exchange": "NSE", "num": "10", "type": "EMA50 Dynamic Breakdown", "signal": "BEARISH", "price": 635.85, "change": -1.37, "vol_ratio": 0.6, "vol_ok": false, "rsi": 49.1, "rsi_zone": "Neutral", "srsi": 57.3, "srsi_zone": "Neutral", "tl": 643.98, "detail": "Price fell below EMA50 dynamic trendline — bearish momentum"}, {"ticker": "ETERNAL", "name": "Eternal", "sector": "Cons. Goods", "exchange": "NSE", "num": "12", "type": "Fibonacci 61.8% Breakdown", "signal": "BEARISH", "price": 247.03, "change": -2.76, "vol_ratio": 1.4, "vol_ok": false, "rsi": 48.8, "rsi_zone": "Neutral", "srsi": 57.3, "srsi_zone": "Neutral", "tl": 249.25, "detail": "Price broke below Fib 61.8% support level at 249.25"}, {"ticker": "ETERNAL", "name": "Eternal", "sector": "Cons. Goods", "exchange": "NSE", "num": "10", "type": "EMA20 Dynamic Breakdown", "signal": "BEARISH", "price": 247.03, "change": -2.76, "vol_ratio": 1.4, "vol_ok": false, "rsi": 48.8, "rsi_zone": "Neutral", "srsi": 57.3, "srsi_zone": "Neutral", "tl": 249.25, "detail": "Price fell below EMA20 dynamic trendline — bearish momentum"}, {"ticker": "ETERNAL", "name": "Eternal", "sector": "Cons. Goods", "exchange": "NSE", "num": "10", "type": "EMA50 Dynamic Breakdown", "signal": "BEARISH", "price": 247.03, "change": -2.76, "vol_ratio": 1.4, "vol_ok": false, "rsi": 48.8, "rsi_zone": "Neutral", "srsi": 57.3, "srsi_zone": "Neutral", "tl": 251.36, "detail": "Price fell below EMA50 dynamic trendline — bearish momentum"}, {"ticker": "TATAMOTORS", "name": "Tata Motors", "sector": "—", "exchange": "NSE", "num": "8", "type": "Fan Line 3rd Break (Major)", "signal": "BEARISH", "price": 526.28, "change": -3.58, "vol_ratio": 1.3, "vol_ok": false, "rsi": 29.6, "rsi_zone": "OS", "srsi": "", "srsi_zone": "—", "tl": 538.46, "detail": "All 3 fan lines broken — major trend exhaustion and reversal confirmed"}]</script>
+<script type="application/json" id="data-nyse">[{"ticker": "NVDA", "name": "NVIDIA", "sector": "Technology", "exchange": "NYSE", "num": "20", "type": "Gann 1×1 Angle Breakdown (45°)", "signal": "BEARISH", "price": 198.45, "change": -0.56, "vol_ratio": 0.9, "vol_ok": false, "rsi": 53.0, "rsi_zone": "Neutral", "srsi": 72.5, "srsi_zone": "OB", "tl": 202.05, "detail": "Price fell below Gann 1×1 angle (45°) from origin 164.27 — trend weakening"}, {"ticker": "AAPL", "name": "Apple Inc", "sector": "Technology", "exchange": "NYSE", "num": "3", "type": "Horizontal Resistance Breakout", "signal": "BULLISH", "price": 280.14, "change": 3.24, "vol_ratio": 1.7, "vol_ok": true, "rsi": 66.4, "rsi_zone": "Strong", "srsi": 72.5, "srsi_zone": "OB", "tl": 276.7, "detail": "Broke above flat multi-week resistance at 276.70"}, {"ticker": "AAPL", "name": "Apple Inc", "sector": "Technology", "exchange": "NYSE", "num": "8", "type": "Fan Line 1st Break (Bounce)", "signal": "BULLISH", "price": 280.14, "change": 3.24, "vol_ratio": 1.7, "vol_ok": true, "rsi": 66.4, "rsi_zone": "Strong", "srsi": 72.5, "srsi_zone": "OB", "tl": 273.76, "detail": "Price broke above first fan line — early trend recovery signal"}, {"ticker": "AAPL", "name": "Apple Inc", "sector": "Technology", "exchange": "NYSE", "num": "12", "type": "Fibonacci 23.6% Breakout", "signal": "BULLISH", "price": 280.14, "change": 3.24, "vol_ratio": 1.7, "vol_ok": true, "rsi": 66.4, "rsi_zone": "Strong", "srsi": 72.5, "srsi_zone": "OB", "tl": 277.38, "detail": "Price broke above Fib 23.6% retracement level at 277.38"}, {"ticker": "AAPL", "name": "Apple Inc", "sector": "Technology", "exchange": "NYSE", "num": "16", "type": "Base Trendline Breakout (Accumulation)", "signal": "BULLISH", "price": 280.14, "change": 3.24, "vol_ratio": 1.7, "vol_ok": true, "rsi": 66.4, "rsi_zone": "Strong", "srsi": 72.5, "srsi_zone": "OB", "tl": 273.79, "detail": "Price broke out of 40-bar accumulation base — strong institutional buying"}, {"ticker": "AAPL", "name": "Apple Inc", "sector": "Technology", "exchange": "NYSE", "num": "18", "type": "Speed Resistance 1/3 Line Recovery", "signal": "BULLISH", "price": 280.14, "change": 3.24, "vol_ratio": 1.7, "vol_ok": true, "rsi": 66.4, "rsi_zone": "Strong", "srsi": 72.5, "srsi_zone": "OB", "tl": 273.32, "detail": "Recovered above 1/3 Speed Resistance Line at 273.32 — trend resuming"}, {"ticker": "MSFT", "name": "Microsoft", "sector": "Technology", "exchange": "NYSE", "num": "18", "type": "Speed Resistance 1/3 Line Recovery", "signal": "BULLISH", "price": 414.44, "change": 1.63, "vol_ratio": 0.9, "vol_ok": false, "rsi": 54.5, "rsi_zone": "Neutral", "srsi": 72.5, "srsi_zone": "OB", "tl": 407.89, "detail": "Recovered above 1/3 Speed Resistance Line at 407.89 — trend resuming"}, {"ticker": "MSFT", "name": "Microsoft", "sector": "Technology", "exchange": "NYSE", "num": "10", "type": "EMA20 Dynamic Breakout", "signal": "BULLISH", "price": 414.44, "change": 1.63, "vol_ratio": 0.9, "vol_ok": false, "rsi": 54.5, "rsi_zone": "Neutral", "srsi": 72.5, "srsi_zone": "OB", "tl": 409.43, "detail": "Price crossed above EMA20 dynamic trendline — bullish momentum"}, {"ticker": "ORCL", "name": "Oracle", "sector": "Technology", "exchange": "NYSE", "num": "12", "type": "Fibonacci 38.2% Breakout", "signal": "BULLISH", "price": 171.83, "change": 6.47, "vol_ratio": 0.8, "vol_ok": false, "rsi": 56.7, "rsi_zone": "Neutral", "srsi": 72.5, "srsi_zone": "OB", "tl": 168.32, "detail": "Price broke above Fib 38.2% retracement level at 168.32"}, {"ticker": "ORCL", "name": "Oracle", "sector": "Technology", "exchange": "NYSE", "num": "10", "type": "EMA20 Dynamic Breakout", "signal": "BULLISH", "price": 171.83, "change": 6.47, "vol_ratio": 0.8, "vol_ok": false, "rsi": 56.7, "rsi_zone": "Neutral", "srsi": 72.5, "srsi_zone": "OB", "tl": 165.4, "detail": "Price crossed above EMA20 dynamic trendline — bullish momentum"}, {"ticker": "ORCL", "name": "Oracle", "sector": "Technology", "exchange": "NYSE", "num": "10", "type": "EMA50 Dynamic Breakout", "signal": "BULLISH", "price": 171.83, "change": 6.47, "vol_ratio": 0.8, "vol_ok": false, "rsi": 56.7, "rsi_zone": "Neutral", "srsi": 72.5, "srsi_zone": "OB", "tl": 162.37, "detail": "Price crossed above EMA50 dynamic trendline — bullish momentum"}, {"ticker": "INTC", "name": "Intel", "sector": "Technology", "exchange": "NYSE", "num": "15", "type": "Parabolic Acceleration Breakout", "signal": "BULLISH", "price": 99.62, "change": 5.44, "vol_ratio": 1.1, "vol_ok": false, "rsi": 87.5, "rsi_zone": "OB", "srsi": 72.5, "srsi_zone": "OB", "tl": 91.74, "detail": "Price accelerating above regression — parabolic up-move (R=0.92, slope=2.17/day)"}, {"ticker": "AMAT", "name": "Applied Materials", "sector": "Technology", "exchange": "NYSE", "num": "20", "type": "Gann 1×1 Angle Breakdown (45°)", "signal": "BEARISH", "price": 389.08, "change": -1.37, "vol_ratio": 0.8, "vol_ok": false, "rsi": 52.8, "rsi_zone": "Neutral", "srsi": 72.5, "srsi_zone": "OB", "tl": 394.45, "detail": "Price fell below Gann 1×1 angle (45°) from origin 320.69 — trend weakening"}, {"ticker": "PLTR", "name": "Palantir Technologies", "sector": "Technology", "exchange": "NYSE", "num": "12", "type": "Fibonacci 50.0% Breakout", "signal": "BULLISH", "price": 144.07, "change": 3.57, "vol_ratio": 0.7, "vol_ok": false, "rsi": 50.6, "rsi_zone": "Neutral", "srsi": 72.5, "srsi_zone": "OB", "tl": 142.54, "detail": "Price broke above Fib 50.0% retracement level at 142.54"}, {"ticker": "PLTR", "name": "Palantir Technologies", "sector": "Technology", "exchange": "NYSE", "num": "20", "type": "Gann 1×1 Angle Breakout (45°)", "signal": "BULLISH", "price": 144.07, "change": 3.57, "vol_ratio": 0.7, "vol_ok": false, "rsi": 50.6, "rsi_zone": "Neutral", "srsi": 72.5, "srsi_zone": "OB", "tl": 141.08, "detail": "Price broke above Gann 1×1 angle (45°) from origin 122.68 — trend acceleration"}, {"ticker": "PLTR", "name": "Palantir Technologies", "sector": "Technology", "exchange": "NYSE", "num": "10", "type": "EMA20 Dynamic Breakout", "signal": "BULLISH", "price": 144.07, "change": 3.57, "vol_ratio": 0.7, "vol_ok": false, "rsi": 50.6, "rsi_zone": "Neutral", "srsi": 72.5, "srsi_zone": "OB", "tl": 142.88, "detail": "Price crossed above EMA20 dynamic trendline — bullish momentum"}, {"ticker": "TSLA", "name": "Tesla", "sector": "Technology", "exchange": "NYSE", "num": "12", "type": "Fibonacci 50.0% Breakout", "signal": "BULLISH", "price": 390.82, "change": 2.41, "vol_ratio": 1.0, "vol_ok": false, "rsi": 56.1, "rsi_zone": "Neutral", "srsi": 72.5, "srsi_zone": "OB", "tl": 386.79, "detail": "Price broke above Fib 50.0% retracement level at 386.79"}, {"ticker": "TSLA", "name": "Tesla", "sector": "Technology", "exchange": "NYSE", "num": "10", "type": "EMA50 Dynamic Breakout", "signal": "BULLISH", "price": 390.82, "change": 2.41, "vol_ratio": 1.0, "vol_ok": false, "rsi": 56.1, "rsi_zone": "Neutral", "srsi": 72.5, "srsi_zone": "OB", "tl": 386.4, "detail": "Price crossed above EMA50 dynamic trendline — bullish momentum"}, {"ticker": "WFC", "name": "Wells Fargo", "sector": "Financials", "exchange": "NYSE", "num": "10", "type": "EMA50 Dynamic Breakdown", "signal": "BEARISH", "price": 80.81, "change": -1.73, "vol_ratio": 0.9, "vol_ok": false, "rsi": 48.0, "rsi_zone": "Neutral", "srsi": 56.2, "srsi_zone": "Neutral", "tl": 82.16, "detail": "Price fell below EMA50 dynamic trendline — bearish momentum"}, {"ticker": "LLY", "name": "Eli Lilly", "sector": "Healthcare", "exchange": "NYSE", "num": "2", "type": "Downtrend Line Breakout", "signal": "BULLISH", "price": 963.33, "change": 3.07, "vol_ratio": 1.4, "vol_ok": false, "rsi": 57.9, "rsi_zone": "Neutral", "srsi": 44.7, "srsi_zone": "Neutral", "tl": 932.09, "detail": "Broke above descending lower-highs trendline → bullish reversal"}, {"ticker": "LLY", "name": "Eli Lilly", "sector": "Healthcare", "exchange": "NYSE", "num": "9", "type": "Internal Trendline Breakout (Up)", "signal": "BULLISH", "price": 963.33, "change": 3.07, "vol_ratio": 1.4, "vol_ok": false, "rsi": 57.9, "rsi_zone": "Neutral", "srsi": 44.7, "srsi_zone": "Neutral", "tl": 939.5, "detail": "Broke above internal mid-body regression line — momentum shift up"}, {"ticker": "LLY", "name": "Eli Lilly", "sector": "Healthcare", "exchange": "NYSE", "num": "12", "type": "Fibonacci 61.8% Breakout", "signal": "BULLISH", "price": 963.33, "change": 3.07, "vol_ratio": 1.4, "vol_ok": false, "rsi": 57.9, "rsi_zone": "Neutral", "srsi": 44.7, "srsi_zone": "Neutral", "tl": 947.76, "detail": "Price broke above Fib 61.8% retracement level at 947.76"}, {"ticker": "LLY", "name": "Eli Lilly", "sector": "Healthcare", "exchange": "NYSE", "num": "14", "type": "Regression Channel Upper Breakout", "signal": "BULLISH", "price": 963.33, "change": 3.07, "vol_ratio": 1.4, "vol_ok": false, "rsi": 57.9, "rsi_zone": "Neutral", "srsi": 44.7, "srsi_zone": "Neutral", "tl": 942.55, "detail": "Price broke above 2σ upper regression band — parabolic extension possible"}, {"ticker": "LLY", "name": "Eli Lilly", "sector": "Healthcare", "exchange": "NYSE", "num": "18", "type": "Speed Resistance 2/3 Line Recovery", "signal": "BULLISH", "price": 963.33, "change": 3.07, "vol_ratio": 1.4, "vol_ok": false, "rsi": 57.9, "rsi_zone": "Neutral", "srsi": 44.7, "srsi_zone": "Neutral", "tl": 935.37, "detail": "Recovered above 2/3 Speed Resistance Line at 935.37 — major support reclaimed"}, {"ticker": "LLY", "name": "Eli Lilly", "sector": "Healthcare", "exchange": "NYSE", "num": "10", "type": "EMA50 Dynamic Breakout", "signal": "BULLISH", "price": 963.33, "change": 3.07, "vol_ratio": 1.4, "vol_ok": false, "rsi": 57.9, "rsi_zone": "Neutral", "srsi": 44.7, "srsi_zone": "Neutral", "tl": 942.56, "detail": "Price crossed above EMA50 dynamic trendline — bullish momentum"}, {"ticker": "ABBV", "name": "AbbVie", "sector": "Healthcare", "exchange": "NYSE", "num": "9", "type": "Internal Trendline Breakdown (Down)", "signal": "BEARISH", "price": 206.6, "change": -2.23, "vol_ratio": 0.9, "vol_ok": false, "rsi": 49.7, "rsi_zone": "Neutral", "srsi": 44.7, "srsi_zone": "Neutral", "tl": 209.6, "detail": "Broke below internal mid-body regression line — momentum shift down"}, {"ticker": "ABBV", "name": "AbbVie", "sector": "Healthcare", "exchange": "NYSE", "num": "12", "type": "Fibonacci 61.8% Breakdown", "signal": "BEARISH", "price": 206.6, "change": -2.23, "vol_ratio": 0.9, "vol_ok": false, "rsi": 49.7, "rsi_zone": "Neutral", "srsi": 44.7, "srsi_zone": "Neutral", "tl": 207.71, "detail": "Price broke below Fib 61.8% support level at 207.71"}, {"ticker": "ABBV", "name": "AbbVie", "sector": "Healthcare", "exchange": "NYSE", "num": "10", "type": "EMA50 Dynamic Breakdown", "signal": "BEARISH", "price": 206.6, "change": -2.23, "vol_ratio": 0.9, "vol_ok": false, "rsi": 49.7, "rsi_zone": "Neutral", "srsi": 44.7, "srsi_zone": "Neutral", "tl": 210.42, "detail": "Price fell below EMA50 dynamic trendline — bearish momentum"}, {"ticker": "MRK", "name": "Merck", "sector": "Healthcare", "exchange": "NYSE", "num": "12", "type": "Fibonacci 78.6% Breakout", "signal": "BULLISH", "price": 112.16, "change": 2.73, "vol_ratio": 1.2, "vol_ok": false, "rsi": 43.2, "rsi_zone": "Neutral", "srsi": 44.7, "srsi_zone": "Neutral", "tl": 111.39, "detail": "Price broke above Fib 78.6% retracement level at 111.39"}, {"ticker": "PM", "name": "Philip Morris", "sector": "Cons. Staples", "exchange": "NYSE", "num": "10", "type": "EMA50 Dynamic Breakout", "signal": "BULLISH", "price": 166.38, "change": 0.79, "vol_ratio": 0.9, "vol_ok": false, "rsi": 53.9, "rsi_zone": "Neutral", "srsi": 58.9, "srsi_zone": "Neutral", "tl": 164.85, "detail": "Price crossed above EMA50 dynamic trendline — bullish momentum"}, {"ticker": "PEP", "name": "PepsiCo", "sector": "Cons. Staples", "exchange": "NYSE", "num": "17", "type": "Role Reversal — Old Support Now Resistance", "signal": "BEARISH", "price": 157.41, "change": -0.68, "vol_ratio": 0.8, "vol_ok": false, "rsi": 53.2, "rsi_zone": "Neutral", "srsi": 58.9, "srsi_zone": "Neutral", "tl": 159.21, "detail": "Polarity flip: old support 159.21 now acting as resistance → bearish continuation"}, {"ticker": "XOM", "name": "ExxonMobil", "sector": "Energy", "exchange": "NYSE", "num": "20", "type": "Gann 1×1 Angle Breakdown (45°)", "signal": "BEARISH", "price": 152.75, "change": -1.02, "vol_ratio": 0.8, "vol_ok": false, "rsi": 49.3, "rsi_zone": "Neutral", "srsi": 58.1, "srsi_zone": "Neutral", "tl": 156.17, "detail": "Price fell below Gann 1×1 angle (45°) from origin 141.97 — trend weakening"}, {"ticker": "CVX", "name": "Chevron", "sector": "Energy", "exchange": "NYSE", "num": "20", "type": "Gann 1×1 Angle Breakdown (45°)", "signal": "BEARISH", "price": 190.63, "change": -1.39, "vol_ratio": 1.0, "vol_ok": false, "rsi": 49.9, "rsi_zone": "Neutral", "srsi": 58.1, "srsi_zone": "Neutral", "tl": 195.51, "detail": "Price fell below Gann 1×1 angle (45°) from origin 177.74 — trend weakening"}, {"ticker": "GEV", "name": "GE Vernova", "sector": "Industrials", "exchange": "NYSE", "num": "12", "type": "Fibonacci 23.6% Breakdown", "signal": "BEARISH", "price": 1062.95, "change": -1.89, "vol_ratio": 0.7, "vol_ok": false, "rsi": 59.7, "rsi_zone": "Neutral", "srsi": 55.7, "srsi_zone": "Neutral", "tl": 1071.47, "detail": "Price broke below Fib 23.6% support level at 1071.47"}, {"ticker": "LIN", "name": "Linde", "sector": "Materials", "exchange": "NYSE", "num": "12", "type": "Fibonacci 23.6% Breakout", "signal": "BULLISH", "price": 507.92, "change": 1.35, "vol_ratio": 1.3, "vol_ok": false, "rsi": 57.0, "rsi_zone": "Neutral", "srsi": 53.5, "srsi_zone": "Neutral", "tl": 502.7, "detail": "Price broke above Fib 23.6% retracement level at 502.70"}, {"ticker": "LIN", "name": "Linde", "sector": "Materials", "exchange": "NYSE", "num": "17", "type": "Role Reversal — Old Resistance Now Support", "signal": "BULLISH", "price": 507.92, "change": 1.35, "vol_ratio": 1.3, "vol_ok": false, "rsi": 57.0, "rsi_zone": "Neutral", "srsi": 53.5, "srsi_zone": "Neutral", "tl": 500.34, "detail": "Polarity flip: old resistance 500.34 held as support → bullish continuation"}, {"ticker": "LIN", "name": "Linde", "sector": "Materials", "exchange": "NYSE", "num": "10", "type": "EMA20 Dynamic Breakout", "signal": "BULLISH", "price": 507.92, "change": 1.35, "vol_ratio": 1.3, "vol_ok": false, "rsi": 57.0, "rsi_zone": "Neutral", "srsi": 53.5, "srsi_zone": "Neutral", "tl": 501.81, "detail": "Price crossed above EMA20 dynamic trendline — bullish momentum"}]</script>
+
+<script>
+var S={exch:'nse',dir:'all',sect:''};
+var DATA={};
+
+var TL_CAT={
+  "1":"Uptrend Line","2":"Downtrend Line","3":"Horizontal",
+  "4":"Channel","5":"Triangle","6":"Wedge",
+  "7":"Flag & Pennant","8":"Fan Lines","9":"Internal TL",
+  "10":"Dynamic EMA","11":"Neckline (H&S)","12":"Fibonacci TL",
+  "13":"Pitchfork","14":"Regression Ch.","15":"Acceleration",
+  "16":"Base TL","17":"Role Reversal","18":"Speed Resistance",
+  "19":"Body TL","20":"Gann Angle"
+};
+
+function loadData(eid){
+  var el=document.getElementById('data-'+eid);
+  if(!el)return[];
+  try{return JSON.parse(el.textContent);}catch(e){return[];}
+}
+
+function groupByTicker(rows){
+  var m={};
+  for(var i=0;i<rows.length;i++){
+    var r=rows[i];
+    if(S.dir!=='all'){
+      var want=S.dir==='bull'?'BULLISH':'BEARISH';
+      if(r.signal!==want)continue;
+    }
+    if(S.sect&&r.sector!==S.sect)continue;
+    var k=r.ticker;
+    if(!m[k])m[k]={ticker:r.ticker,name:r.name,sector:r.sector,exchange:r.exchange,
+                    price:r.price,change:r.change,vol_ratio:r.vol_ratio,vol_ok:r.vol_ok,
+                    rsi:r.rsi,rsi_zone:r.rsi_zone,srsi:r.srsi,srsi_zone:r.srsi_zone,sigs:[]};
+    m[k].sigs.push({num:r.num,type:r.type,signal:r.signal,detail:r.detail,tl:r.tl});
+  }
+  var arr=Object.values(m);
+  arr.sort(function(a,b){return b.sigs.length-a.sigs.length;});
+  return arr;
+}
+
+function cardDir(sigs){
+  var b=0;
+  for(var i=0;i<sigs.length;i++){if(sigs[i].signal==='BULLISH')b++;}
+  return b===sigs.length?'bull':b===0?'bear':'mix';
+}
+
+function rsiCls(zone){
+  if(zone==='OB')return'ob';if(zone==='OS')return'os';
+  if(zone==='Strong')return'str';if(zone==='Weak')return'wk';
+  return'neu';
+}
+
+function fmtPrice(p,exch){
+  var sym=exch==='NSE'?'\u20b9':'$';
+  return sym+p.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
+}
+
+function buildCard(s){
+  var d=cardDir(s.sigs);
+  var bc=s.sigs.filter(function(x){return x.signal==='BULLISH';}).length;
+  var rc=s.sigs.length-bc;
+  var badgeLabel=d==='bull'?s.sigs.length+' \u25b2 bull'
+                :d==='bear'?s.sigs.length+' \u25bc bear'
+                :bc+'\u25b2 '+rc+'\u25bc';
+  var rsiHtml=s.rsi!==''?'<span class="c-rsi '+d+'">RSI '+s.rsi+' &middot; '+s.rsi_zone+'</span>':'';
+  var volCls=s.vol_ok?'vok':'';
+  var volCheck=s.vol_ok?' \u2713':'';
+  var chgCls=s.change>=0?'up':'dn';
+  var chgSign=s.change>=0?'+':'';
+
+  var sigRows=s.sigs.map(function(sg){
+    var up=sg.signal==='BULLISH';
+    return '<div class="sig">'
+      +'<span class="sig-n">#'+sg.num+'</span>'
+      +'<span class="sig-t">'+sg.type+'</span>'
+      +'<span class="sig-d '+(up?'up':'dn')+'">'+(up?'\u25b2':'\u25bc')+'</span>'
+      +'</div>'
+      +'<div class="sig-detail">'+sg.detail+'</div>';
+  }).join('');
+
+  return '<div class="card '+d+'">'
+    +'<div class="c-head">'
+      +'<div class="c-left">'
+        +'<div class="c-ticker">'+s.ticker+'</div>'
+        +'<div class="c-name">'+s.name+'</div>'
+      +'</div>'
+      +'<div class="c-right">'
+        +'<span class="c-sect">'+s.sector+'</span>'
+        +'<span class="c-badge '+d+'">'+badgeLabel+'</span>'
+      +'</div>'
+    +'</div>'
+    +'<div class="c-prow">'
+      +'<span class="c-price">'+fmtPrice(s.price,s.exchange)+'</span>'
+      +'<span class="c-chg '+chgCls+'">'+chgSign+s.change+'%</span>'
+      +rsiHtml
+      +'<span class="c-vol '+volCls+'">'+s.vol_ratio+'x'+volCheck+'</span>'
+    +'</div>'
+    +'<div>'+sigRows+'</div>'
+    +'</div>';
+}
+
+var SECT_COL={
+  'Banking':       '#3b82f6',
+  'Fin. Services': '#8b5cf6',
+  'IT':            '#22d3ee',
+  'Auto':          '#f97316',
+  'Cons. Goods':   '#ec4899',
+  'FMCG':          '#10b981',
+  'Infra/Defence': '#6366f1',
+  'Metals':        '#94a3b8',
+  'Pharma':        '#14b8a6',
+  'Energy':        '#f59e0b',
+  'Technology':    '#22d3ee',
+  'Financials':    '#3b82f6',
+  'Healthcare':    '#14b8a6',
+  'Cons. Staples': '#a78bfa',
+  'Cons. Discret.':'#ec4899',
+  'Industrials':   '#84cc16',
+  'Comm. Services':'#f43f5e',
+  'Materials':     '#94a3b8',
+};
+function sectCol(s){return SECT_COL[s]||'#60b8ff';}
+function rsiColor(v){
+  if(v<30)  return '#34d97b';
+  if(v<45)  return '#86efac';
+  if(v<=55) return '#e8f2ff';
+  if(v<=70) return '#fbbf24';
+  return '#f87171';
+}
+
+function buildSectorRsi(rows,eid){
+  var seen={};
+  rows.forEach(function(r){
+    if(r.sector&&r.sector!=='\u2014'&&!(r.sector in seen)&&r.srsi!==''){
+      seen[r.sector]=r.srsi;
+    }
+  });
+  var entries=Object.entries(seen).sort(function(a,b){return a[1]-b[1];});
+  if(!entries.length)return;
+  var tiles=entries.map(function(e){
+    var s=e[0],v=e[1];
+    var sc=sectCol(s);
+    var rc=rsiColor(v);
+    var act=S.sect===s?' active':'';
+    return '<div class="srp-tile'+act+'" onclick="toggleSect(\''+s+'\')" style="border-left-color:'+sc+'">'
+      +'<span class="srp-sname" style="color:'+sc+'">'+s+'</span>'
+      +'<span class="srp-val" style="color:'+rc+'">'+v+'</span>'
+      +'</div>';
+  }).join('');
+  var el=document.getElementById('srp-'+eid);
+  if(el)el.innerHTML='<div class="srp-title">&#128200; Sector RSI &mdash; click a tile to filter</div>'
+    +'<div class="srp-tiles">'+tiles+'</div>';
+}
+
+function populateSectors(){
+  var rows=DATA[S.exch]||[];
+  var seen={};var sects=[];
+  rows.forEach(function(r){
+    if(r.sector&&r.sector!=='\u2014'&&!seen[r.sector]){seen[r.sector]=1;sects.push(r.sector);}
+  });
+  sects.sort();
+  var sel=document.getElementById('sect-select');
+  if(!sel)return;
+  sel.innerHTML='<option value="">All sectors</option>';
+  sects.forEach(function(s){
+    var o=document.createElement('option');
+    o.value=s;o.textContent=s;
+    if(S.sect===s)o.selected=true;
+    sel.appendChild(o);
+  });
+}
+
+function renderCards(eid){
+  var rows=DATA[eid]||[];
+  var stocks=groupByTicker(rows);
+  var grid=document.getElementById('grid-'+eid);
+  if(!grid)return;
+  if(!stocks.length){
+    grid.innerHTML='<div class="empty">No signals match current filters.</div>';
+  } else {
+    grid.innerHTML=stocks.map(buildCard).join('');
+  }
+  var sigTotal=stocks.reduce(function(n,s){return n+s.sigs.length;},0);
+  var rc=document.getElementById('result-count');
+  if(eid===S.exch&&rc)rc.textContent=stocks.length+' tickers \u00b7 '+sigTotal+' signals';
+}
+
+function buildLegend(eid){
+  var rows=DATA[eid]||[];
+  var cnt={};
+  rows.forEach(function(r){cnt[r.num]=(cnt[r.num]||0)+1;});
+  var parts=[];
+  for(var i=1;i<=20;i++){
+    var n=String(i);
+    var hit=cnt[n]?'<span class="lhit">'+cnt[n]+'</span>':'';
+    parts.push('<div class="lgi"><span class="ln">'+n+'</span>'
+      +'<span style="color:var(--txt)">'+TL_CAT[n]+'</span>'+hit+'</div>');
+  }
+  var el=document.getElementById('lgnd-'+eid);
+  if(el)el.innerHTML=parts.join('');
+}
+
+function updateStats(){
+  var rows=DATA[S.exch]||[];
+  if(S.sect)rows=rows.filter(function(r){return r.sector===S.sect;});
+  var shown=S.dir==='all'?rows:rows.filter(function(r){
+    return r.signal===(S.dir==='bull'?'BULLISH':'BEARISH');
+  });
+  var b=shown.filter(function(r){return r.signal==='BULLISH';}).length;
+  var r=shown.filter(function(r){return r.signal==='BEARISH';}).length;
+  var v=shown.filter(function(r){return r.vol_ok;}).length;
+  var el;
+  if(el=document.getElementById('stat-total'))el.textContent=shown.length;
+  if(el=document.getElementById('stat-bull')) el.textContent=b;
+  if(el=document.getElementById('stat-bear')) el.textContent=r;
+  if(el=document.getElementById('stat-vol'))  el.textContent=v;
+}
+
+function switchExch(ex){
+  S.exch=ex;S.sect='';
+  document.getElementById('panel-nse').classList.toggle('active',ex==='nse');
+  document.getElementById('panel-nyse').classList.toggle('active',ex==='nyse');
+  document.getElementById('srp-nse').style.display=ex==='nse'?'':'none';
+  document.getElementById('srp-nyse').style.display=ex==='nyse'?'':'none';
+  var bns=document.getElementById('btn-nse');
+  var bny=document.getElementById('btn-nyse');
+  if(bns)bns.className='btn'+(ex==='nse'?' on':'');
+  if(bny)bny.className='btn'+(ex==='nyse'?' on':'');
+  var ss=document.getElementById('sect-select');
+  if(ss)ss.value='';
+  populateSectors();
+  renderCards(ex);
+  updateStats();
+}
+
+function setDir(d){
+  S.dir=d;
+  ['all','bull','bear'].forEach(function(x){
+    var b=document.getElementById('btn-'+x);
+    if(!b)return;
+    if(x===d){
+      b.className='btn'+(x==='bull'?' bull-on':x==='bear'?' bear-on':' on');
+    } else {
+      b.className='btn';
+    }
+  });
+  renderCards(S.exch);
+  updateStats();
+}
+
+function setSect(s){
+  S.sect=s;
+  document.querySelectorAll('.srp-tile').forEach(function(t){
+    var nm=t.querySelector('.srp-sname');
+    if(nm)t.classList.toggle('active',nm.textContent===s);
+  });
+  renderCards(S.exch);
+  updateStats();
+}
+
+function toggleSect(s){
+  S.sect=(S.sect===s?'':s);
+  var ss=document.getElementById('sect-select');
+  if(ss)ss.value=S.sect;
+  setSect(S.sect);
+}
+
+document.addEventListener('DOMContentLoaded',function(){
+  DATA.nse=loadData('nse');
+  DATA.nyse=loadData('nyse');
+  buildSectorRsi(DATA.nse,'nse');
+  buildSectorRsi(DATA.nyse,'nyse');
+  populateSectors();
+  renderCards('nse');
+  renderCards('nyse');
+  buildLegend('nse');
+  buildLegend('nyse');
+  updateStats();
+});
+
+function isDST(d){
+  var j=new Date(d.getFullYear(),0,1).getTimezoneOffset();
+  var u=new Date(d.getFullYear(),6,1).getTimezoneOffset();
+  return d.getTimezoneOffset()<Math.max(j,u);
+}
+function updateClock(){
+  var n=new Date();
+  var istMs=n.getTime()+330*60000;
+  var estMs=n.getTime()+(isDST(n)?-240:-300)*60000;
+  function t(ms){return new Date(ms).toISOString().substr(11,8);}
+  var ei=document.getElementById('clk-ist');
+  var ee=document.getElementById('clk-est');
+  var el=document.getElementById('clk-est-lbl');
+  if(ei)ei.textContent=t(istMs);
+  if(ee)ee.textContent=t(estMs);
+  if(el)el.textContent=isDST(n)?'EDT':'EST';
+}
+setInterval(updateClock,1000);
+updateClock();
+</script>
+</body></html>
