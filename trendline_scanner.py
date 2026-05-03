@@ -1218,6 +1218,11 @@ body{background:var(--nb);color:var(--txt);font-family:system-ui,sans-serif;font
 .c-vol.vok{color:var(--bu)}
 .c-tl{font-size:10px;color:var(--acc3);font-family:var(--mono)}
 
+/* Signal block wrapper — hidden by default */
+.sig-block{max-height:0;overflow:hidden;opacity:0;
+  transition:max-height .28s ease, opacity .2s ease}
+.card.expanded .sig-block{max-height:1000px;opacity:1}
+
 /* Signal rows */
 .sig{display:flex;align-items:baseline;gap:5px;padding:3px 0;
   border-bottom:1px solid rgba(56,163,245,0.08);font-size:11px}
@@ -1228,8 +1233,24 @@ body{background:var(--nb);color:var(--txt);font-family:system-ui,sans-serif;font
 .sig-t{color:var(--txt);flex:1;line-height:1.35}
 .sig-d{flex-shrink:0;font-size:10px;font-weight:700}
 .sig-d.up{color:var(--bu)}.sig-d.dn{color:var(--be)}
+
+/* Detail text — hidden by default, shown when card has .expanded class */
 .sig-detail{font-size:10px;color:var(--mu);font-style:italic;
-  padding:1px 0 4px 29px;line-height:1.3}
+  padding:0 0 0 29px;line-height:1.3;max-height:0;overflow:hidden;
+  opacity:0;transition:max-height .22s ease, opacity .18s ease, padding .18s ease}
+.card.expanded .sig-detail{max-height:60px;opacity:1;padding:1px 0 4px 29px}
+
+/* Toggle button */
+.c-toggle{display:flex;align-items:center;gap:4px;margin-top:7px;
+  padding:3px 9px;border-radius:10px;font-size:10px;font-family:var(--mono);
+  font-weight:700;cursor:pointer;border:1px solid var(--bdr);
+  background:rgba(255,255,255,0.04);color:var(--mu);
+  width:fit-content;transition:all .15s;user-select:none}
+.c-toggle:hover{border-color:var(--acc2);color:var(--acc2)}
+.card.expanded .c-toggle{background:rgba(46,143,228,0.1);
+  border-color:var(--bdr2);color:var(--acc2)}
+.c-toggle-arrow{display:inline-block;transition:transform .2s ease;font-size:9px}
+.card.expanded .c-toggle-arrow{transform:rotate(180deg)}
 
 /* TL Coverage Legend */
 .lgnd{margin:14px 0 0;background:rgba(0,0,0,0.2);border:1px solid var(--bdr);
@@ -1432,7 +1453,8 @@ function buildCard(s){
       +'<div class="sig-detail">'+sg.detail+'</div>';
   }).join('');
 
-  return '<div class="card '+d+'">'
+  var uid='c'+Math.random().toString(36).substr(2,7);
+  return '<div class="card '+d+'" id="'+uid+'">'
     +'<div class="c-head">'
       +'<div class="c-left">'
         +'<div class="c-ticker">'+s.ticker+'</div>'
@@ -1449,8 +1471,20 @@ function buildCard(s){
       +rsiHtml
       +'<span class="c-vol '+volCls+'">'+s.vol_ratio+'x'+volCheck+'</span>'
     +'</div>'
-    +'<div>'+sigRows+'</div>'
+    +'<div class="sig-block"><div>'+sigRows+'</div></div>'
+    +'<div class="c-toggle" onclick="toggleCard(\''+uid+'\')">'
+      +'<span class="c-toggle-arrow">&#9660;</span>'
+      +'<span class="c-toggle-lbl">details</span>'
+    +'</div>'
     +'</div>';
+}
+
+function toggleCard(uid){
+  var el=document.getElementById(uid);
+  if(!el)return;
+  var expanded=el.classList.toggle('expanded');
+  var lbl=el.querySelector('.c-toggle-lbl');
+  if(lbl)lbl.textContent=expanded?'hide details':'details';
 }
 
 var SECT_COL={
