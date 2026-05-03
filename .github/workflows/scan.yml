@@ -1,0 +1,67 @@
+name: TrendBreak Scanner
+
+# ── Triggers ──────────────────────────────────────────────────────────────────
+on:
+  schedule:
+    # Runs at 11:00 AM UTC (4:30 PM IST) on weekdays — after NSE close
+    # Also catches NYSE pre-market data. Change time as needed.
+    - cron: '0 11 * * 1-5'
+
+  # Allows you to run the scan manually from the Actions tab anytime
+  workflow_dispatch:
+
+# ── Permissions (needed to commit the HTML back to the repo) ──────────────────
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+# ── Job ───────────────────────────────────────────────────────────────────────
+jobs:
+  scan-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Check out your repo
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # 2. Set up Python
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # 3. Cache pip packages so repeat runs are faster
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
+
+      # 4. Install dependencies
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # 5. Run the scanner — generates trendline_breakout_report.html
+      - name: Run TrendBreak scanner
+        run: python trendline_scanner.py
+
+      # 6. Copy report to docs/index.html  (GitHub Pages serves from /docs)
+      - name: Prepare docs folder
+        run: |
+          mkdir -p docs
+          cp trendline_breakout_report.html docs/index.html
+          echo "Report copied to docs/index.html"
+
+      # 7. Commit and push the updated report back to main
+      - name: Commit updated report
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/index.html
+          # Only commit if something actually changed
+          git diff --staged --quiet || \
+            git commit -m "📊 Auto scan: $(date -u '+%Y-%m-%d %H:%M UTC')"
+          git push
