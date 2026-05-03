@@ -40,22 +40,33 @@ jobs:
           key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
           restore-keys: ${{ runner.os }}-pip-
 
-      # 4. Install dependencies
+      # 4. Install dependencies directly — no requirements.txt needed
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install yfinance>=0.2.28 pandas>=2.0.0 numpy>=1.24.0
 
-      # 5. Run the scanner — generates trendline_breakout_report.html
+      # 5. Confirm the scanner script is present before running
+      - name: Check scanner script exists
+        run: |
+          if [ ! -f trendline_scanner.py ]; then
+            echo "❌ trendline_scanner.py not found in repo root!"
+            echo "Make sure you committed the file. Repo contents:"
+            ls -la
+            exit 1
+          fi
+          echo "✅ trendline_scanner.py found"
+
+      # 6. Run the scanner — generates trendline_breakout_report.html
       - name: Run TrendBreak scanner
         run: python trendline_scanner.py
 
-      # 6. Copy report to docs/index.html  (GitHub Pages serves from /docs)
+      # 7. Copy report to docs/index.html  (GitHub Pages serves from /docs)
       - name: Prepare docs folder
         run: |
           mkdir -p docs
           cp trendline_breakout_report.html docs/index.html
           echo "Report copied to docs/index.html"
 
-      # 7. Commit and push the updated report back to main
+      # 8. Commit and push the updated report back to main
       - name: Commit updated report
         run: |
           git config user.name  "github-actions[bot]"
