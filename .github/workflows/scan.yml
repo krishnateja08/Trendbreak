@@ -3,9 +3,15 @@ name: TrendBreak Scanner
 # ── Triggers ──────────────────────────────────────────────────────────────────
 on:
   schedule:
-    # Runs at 11:00 AM UTC (4:30 PM IST) on weekdays — after NSE close
-    # Also catches NYSE pre-market data. Change time as needed.
+    # Run 1 — 4:30 PM IST (11:00 UTC) weekdays
+    #   → NSE has just closed (3:30 PM IST) ✅ full NSE day data
+    #   → NYSE not open yet (opens 2:30 PM UTC / 9:30 AM EST) — uses prev day close
     - cron: '0 11 * * 1-5'
+
+    # Run 2 — 2:30 AM IST next day (21:00 UTC) weekdays
+    #   → NSE closed ✅
+    #   → NYSE just closed (4:00 PM EST / 3:00 PM EDT) ✅ full NYSE EOD data
+    - cron: '0 21 * * 1-5'
 
   # Allows you to run the scan manually from the Actions tab anytime
   workflow_dispatch:
@@ -47,17 +53,17 @@ jobs:
       # 5. Confirm the scanner script is present before running
       - name: Check scanner script exists
         run: |
-          if [ ! -f trendline_scanner.py ]; then
-            echo "❌ trendline_scanner.py not found in repo root!"
+          if [ ! -f trendline_scanner_v3.py ]; then
+            echo "❌ trendline_scanner_v3.py not found in repo root!"
             echo "Make sure you committed the file. Repo contents:"
             ls -la
             exit 1
           fi
-          echo "✅ trendline_scanner.py found"
+          echo "✅ trendline_scanner_v3.py found"
 
       # 6. Run the scanner — generates trendline_breakout_report.html
       - name: Run TrendBreak scanner
-        run: python trendline_scanner.py
+        run: python trendline_scanner_v3.py
 
       # 7. Copy report to docs/index.html  (GitHub Pages serves from /docs)
       - name: Prepare docs folder
