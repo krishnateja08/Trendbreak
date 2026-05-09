@@ -26,6 +26,23 @@
 18.  Speed Resistance Lines (1/3 and 2/3 lines)
 19.  Candlestick Body Trendline (No-wick trendline)
 20.  Gann Angle (1x1 = 45° rule)
+
+═══════════════════════════════════════════════════════════════
+FIXES APPLIED (v2):
+  FIX-01  NSE tickers corrected: LTM→LTIM, TATACAP→JIOFIN
+  FIX-02  Gann unit: origin_v/100 → origin_v*0.001 (was 100× too large)
+  FIX-03  Regression channel: description corrected (lower breakdown = BEARISH momentum)
+  FIX-04  Base trendline: added missing BEARISH breakdown signal
+  FIX-05  Pitchfork: pivots sorted by bar-index before A/B/C assignment
+  FIX-06  Internal trendline: regression limited to last 50 bars (was all 130)
+  FIX-07  Acceleration: correlation threshold 0.90→0.80; residual relaxed to 2-of-3
+  FIX-08  Speed resistance: 2/3 level checked before 1/3 (stronger signal first)
+  FIX-09  Fibonacci: EMA-slope direction filter added (no counter-trend Fib signals)
+  FIX-10  scan_stock: deduplication — max 2 signals per direction per stock
+  FIX-11  Role reversal: proximity band widened 2%→3%
+  FIX-12  Base range threshold: exchange-aware (0.20 NSE, 0.15 NYSE)
+  FIX-13  Flag pole threshold: exchange-aware (7% NSE, 4% NYSE)
+═══════════════════════════════════════════════════════════════
 """
 
 import os
@@ -46,7 +63,6 @@ warnings.filterwarnings("ignore")
 
 try:
     import yfinance as yf
-    # Also silence yfinance's internal perf logger
     logging.getLogger("peewee").setLevel(logging.CRITICAL)
     YF_AVAILABLE = True
 except ImportError:
@@ -64,53 +80,56 @@ NSE_STOCKS = [
     ("AXISBANK",    "Axis Bank",               1189.60),
     ("CANBK",       "Canara Bank",              102.85),
     ("BANKBARODA",  "Bank of Baroda",           248.30),
-    ("UNIONBANK",   "Union Bank of India",       133.20),
-    ("PNB",         "Punjab National Bank",      105.60),
+    ("UNIONBANK",   "Union Bank of India",      133.20),
+    ("PNB",         "Punjab National Bank",     105.60),
     # ── Financial Services (NIFTY_FIN_SERVICE) ────────────────────
-    ("BAJFINANCE",  "Bajaj Finance",            7124.50),
-    ("BAJAJFINSV",  "Bajaj Finserv",            1672.80),
-    ("MUTHOOTFIN",  "Muthoot Finance",          1938.45),
-    ("CHOLAFIN",    "Cholamandalam Finance",    1312.60),
-    ("SBILIFE",     "SBI Life Insurance",       1512.30),
-    ("HDFCLIFE",    "HDFC Life Insurance",       624.75),
-    ("SHRIRAMFIN",  "Shriram Finance",          2814.90),
-    ("TATACAP",     "Tata Capital",              987.25),
-    ("IRFC",        "Indian Railway Fin Corp",   192.40),
-    ("PFC",         "Power Finance Corp",        452.30),
-    ("RECLTD",      "REC Limited",               512.80),
-    ("HDFCAMC",     "HDFC AMC",                4012.60),
-    ("BAJAJHLDNG",  "Bajaj Holdings",           9824.50),
+    ("BAJFINANCE",  "Bajaj Finance",           7124.50),
+    ("BAJAJFINSV",  "Bajaj Finserv",           1672.80),
+    ("MUTHOOTFIN",  "Muthoot Finance",         1938.45),
+    ("CHOLAFIN",    "Cholamandalam Finance",   1312.60),
+    ("SBILIFE",     "SBI Life Insurance",      1512.30),
+    ("HDFCLIFE",    "HDFC Life Insurance",      624.75),
+    ("SHRIRAMFIN",  "Shriram Finance",         2814.90),
+    # FIX-01: TATACAP removed (Tata Capital not separately listed on NSE)
+    #         Replaced with JIOFIN (Jio Financial Services — listed Aug 2023)
+    ("JIOFIN",      "Jio Financial Services",   312.50),
+    ("IRFC",        "Indian Railway Fin Corp",  192.40),
+    ("PFC",         "Power Finance Corp",       452.30),
+    ("RECLTD",      "REC Limited",              512.80),
+    ("HDFCAMC",     "HDFC AMC",               4012.60),
+    ("BAJAJHLDNG",  "Bajaj Holdings",          9824.50),
     # ── IT & Technology (^CNXIT) ──────────────────────────────────
-    ("TCS",         "Tata Consultancy",         3421.20),
-    ("INFY",        "Infosys",                  1181.80),
-    ("WIPRO",       "Wipro",                     538.90),
-    ("TECHM",       "Tech Mahindra",            1473.50),
-    ("HCLTECH",     "HCL Technologies",         1612.45),
-    ("LTM",         "LTIMindtree",              5234.80),
+    ("TCS",         "Tata Consultancy",        3421.20),
+    ("INFY",        "Infosys",                 1181.80),
+    ("WIPRO",       "Wipro",                    538.90),
+    ("TECHM",       "Tech Mahindra",           1473.50),
+    ("HCLTECH",     "HCL Technologies",        1612.45),
+    # FIX-01: LTM → LTIM (correct NSE symbol for LTIMindtree)
+    ("LTIM",        "LTIMindtree",             5234.80),
     # ── Oil, Gas & Energy (^CNXENERGY) ────────────────────────────
-    ("RELIANCE",    "Reliance Industries",      2890.50),
-    ("ONGC",        "ONGC",                      268.50),
-    ("BPCL",        "BPCL",                      312.40),
-    ("GAIL",        "GAIL India",                212.75),
-    ("IOC",         "Indian Oil Corp",           164.30),
-    ("TATAPOWER",   "Tata Power",                412.60),
-    ("ADANIGREEN",  "Adani Green Energy",       1724.85),
-    ("ADANIENSOL",  "Adani Energy Solutions",    812.40),
-    ("ADANIPOWER",  "Adani Power",               221.85),
-    ("NTPC",        "NTPC",                      362.80),
-    ("POWERGRID",   "Power Grid Corp",           316.45),
-    ("SOLARINDS",   "Solar Industries",         9124.50),
+    ("RELIANCE",    "Reliance Industries",     2890.50),
+    ("ONGC",        "ONGC",                     268.50),
+    ("BPCL",        "BPCL",                     312.40),
+    ("GAIL",        "GAIL India",               212.75),
+    ("IOC",         "Indian Oil Corp",          164.30),
+    ("TATAPOWER",   "Tata Power",               412.60),
+    ("ADANIGREEN",  "Adani Green Energy",      1724.85),
+    ("ADANIENSOL",  "Adani Energy Solutions",   812.40),
+    ("ADANIPOWER",  "Adani Power",              221.85),
+    ("NTPC",        "NTPC",                     362.80),
+    ("POWERGRID",   "Power Grid Corp",          316.45),
+    ("SOLARINDS",   "Solar Industries",        9124.50),
     # ── Auto & Auto Ancillary (^CNXAUTO) ──────────────────────────
-    ("MARUTI",      "Maruti Suzuki",           12340.00),
+    ("MARUTI",      "Maruti Suzuki",          12340.00),
     ("BAJAJ-AUTO",  "Bajaj Auto",              9994.00),
-    ("M&M",         "Mahindra & Mahindra",      2812.30),
-    ("EICHERMOT",   "Eicher Motors",            4612.80),
-    ("TVSMOTOR",    "TVS Motor",               2314.60),
-    ("MOTHERSON",   "Samvardhana Motherson",     142.35),
-    ("BOSCHLTD",    "Bosch",                  34812.00),
-    ("CUMMINSIND",  "Cummins India",            3412.50),
+    ("M&M",         "Mahindra & Mahindra",     2812.30),
+    ("EICHERMOT",   "Eicher Motors",           4612.80),
+    ("TVSMOTOR",    "TVS Motor",              2314.60),
+    ("MOTHERSON",   "Samvardhana Motherson",    142.35),
+    ("BOSCHLTD",    "Bosch",                 34812.00),
+    ("CUMMINSIND",  "Cummins India",           3412.50),
     # ── Pharma & Healthcare (^CNXPHARMA) ──────────────────────────
-    ("SUNPHARMA",   "Sun Pharma",              1808.30),
+    ("SUNPHARMA",   "Sun Pharma",             1808.30),
     ("DRREDDY",     "Dr Reddy's Labs",         1284.60),
     ("CIPLA",       "Cipla",                   1512.80),
     ("DIVISLAB",    "Divi's Laboratories",     5124.30),
@@ -119,10 +138,10 @@ NSE_STOCKS = [
     ("ZYDUSLIFE",   "Zydus Lifesciences",      1124.80),
     ("MAXHEALTH",   "Max Healthcare",          1012.60),
     # ── Metals & Mining (^CNXMETAL) ───────────────────────────────
-    ("JSWSTEEL",    "JSW Steel",               1012.40),
-    ("TATASTEEL",   "Tata Steel",               168.75),
-    ("HINDALCO",    "Hindalco Industries",       682.30),
-    ("VEDL",        "Vedanta",                   462.80),
+    ("JSWSTEEL",    "JSW Steel",              1012.40),
+    ("TATASTEEL",   "Tata Steel",              168.75),
+    ("HINDALCO",    "Hindalco Industries",      682.30),
+    ("VEDL",        "Vedanta",                  462.80),
     ("COALINDIA",   "Coal India",               412.60),
     ("HINDZINC",    "Hindustan Zinc",           312.45),
     ("JINDALSTEL",  "Jindal Steel & Power",     924.80),
@@ -132,8 +151,8 @@ NSE_STOCKS = [
     ("NESTLEIND",   "Nestle India",            2412.80),
     ("BRITANNIA",   "Britannia Industries",    5312.60),
     ("TATACONSUM",  "Tata Consumer Products",  1012.40),
-    ("GODREJCP",    "Godrej Consumer Products", 1212.80),
-    ("VBL",         "Varun Beverages",          1612.30),
+    ("GODREJCP",    "Godrej Consumer Products",1212.80),
+    ("VBL",         "Varun Beverages",         1612.30),
     ("UNITDSPR",    "United Spirits",          1124.60),
     # ── Infra, Capital Goods & Defence (^CNXINFRA) ────────────────
     ("LT",          "Larsen & Toubro",         3512.80),
@@ -145,7 +164,7 @@ NSE_STOCKS = [
     ("ABB",         "ABB India",               8012.60),
     ("CGPOWER",     "CG Power & Ind Solutions", 712.40),
     ("MAZDOCK",     "Mazagon Dock",            4812.30),
-    ("DLF",         "DLF",                     812.60),
+    ("DLF",         "DLF",                      812.60),
     ("LODHA",       "Macrotech Developers",    1312.40),
     ("BHARTIARTL",  "Bharti Airtel",           1880.90),
     # ── Cement & Consumer Discretionary (^CNXCONSUM) ──────────────
@@ -160,8 +179,8 @@ NSE_STOCKS = [
     ("DMART",       "Avenue Supermarts",       4812.60),
     ("INDHOTEL",    "Indian Hotels",            612.80),
     ("INDIGO",      "IndiGo (InterGlobe)",     4412.30),
-    ("ETERNAL",     "Eternal",                  312.45),
-    # ── Previously in scanner, not in sector map ───────────────────
+    ("ETERNAL",     "Eternal (Zomato)",         312.45),
+    # ── Others ───────────────────────────────────────────────────
     ("RBLBANK",     "RBL Bank",                 391.75),
     ("TATAMOTORS",  "Tata Motors",              778.25),
 ]
@@ -174,7 +193,7 @@ NYSE_STOCKS = [
     ("GOOGL", "Alphabet (Class A)",      176.30),
     ("GOOG",  "Alphabet (Class C)",      178.10),
     ("META",  "Meta Platforms",          578.15),
-    ("AVGO",  "Broadcom",               1742.80),
+    ("AVGO",  "Broadcom",              1742.80),
     ("MU",    "Micron Technology",        98.42),
     ("ORCL",  "Oracle",                  128.74),
     ("AMD",   "AMD",                     148.20),
@@ -226,102 +245,83 @@ NYSE_STOCKS = [
     ("VZ",    "Verizon",                  42.18),
     # ── Materials (XLB) ───────────────────────────────────────────
     ("LIN",   "Linde",                   482.60),
-    # ── Previously in scanner, not in sector map ──────────────────
+    # ── Others ───────────────────────────────────────────────────
     ("DIS",   "Walt Disney",              96.40),
     ("PYPL",  "PayPal",                   77.65),
 ]
 
 # ── Sector Maps ───────────────────────────────────────────────────────────────
 USA_SECTOR_MAP = {
-    # Technology (XLK)
     **{s: "XLK" for s in [
         "NVDA","AAPL","MSFT","GOOGL","GOOG","META","AVGO","MU","ORCL",
         "AMD","CSCO","IBM","INTC","LRCX","AMAT","PLTR","AMZN","TSLA",
     ]},
-    # Financials (XLF)
     **{s: "XLF" for s in [
         "BRK-B","JPM","V","MA","BAC","MS","WFC","GS","AXP",
     ]},
-    # Healthcare (XLV)
     **{s: "XLV" for s in [
         "LLY","JNJ","ABBV","MRK","UNH",
     ]},
-    # Consumer Staples (XLP)
     **{s: "XLP" for s in [
         "WMT","COST","PG","KO","PM","PEP",
     ]},
-    # Consumer Discretionary (XLY)
     **{s: "XLY" for s in [
         "HD","NFLX","MCD",
     ]},
-    # Energy (XLE)
     **{s: "XLE" for s in [
         "XOM","CVX",
     ]},
-    # Industrials (XLI)
     **{s: "XLI" for s in [
         "CAT","GE","RTX","GEV",
     ]},
-    # Communication Services (XLC)
     **{s: "XLC" for s in [
         "TMUS","VZ",
     ]},
-    # Materials (XLB)
     **{s: "XLB" for s in [
         "LIN",
     ]},
 }
 
 INDIA_SECTOR_MAP = {
-    # Banking & Finance
     **{s: "^NSEBANK" for s in [
         "HDFCBANK.NS","ICICIBANK.NS","SBIN.NS","KOTAKBANK.NS","AXISBANK.NS",
         "CANBK.NS","BANKBARODA.NS","UNIONBANK.NS","PNB.NS",
     ]},
     **{s: "NIFTY_FIN_SERVICE.NS" for s in [
         "BAJFINANCE.NS","BAJAJFINSV.NS","MUTHOOTFIN.NS","CHOLAFIN.NS",
-        "SBILIFE.NS","HDFCLIFE.NS","SHRIRAMFIN.NS","TATACAP.NS",
+        "SBILIFE.NS","HDFCLIFE.NS","SHRIRAMFIN.NS","JIOFIN.NS",
         "IRFC.NS","PFC.NS","RECLTD.NS","HDFCAMC.NS","BAJAJHLDNG.NS",
     ]},
-    # IT & Technology
     **{s: "^CNXIT" for s in [
-        "TCS.NS","INFY.NS","WIPRO.NS","TECHM.NS","HCLTECH.NS","LTM.NS",
+        # FIX-01: updated LTIM.NS (was LTM.NS)
+        "TCS.NS","INFY.NS","WIPRO.NS","TECHM.NS","HCLTECH.NS","LTIM.NS",
     ]},
-    # Oil & Gas / Energy
     **{s: "^CNXENERGY" for s in [
         "RELIANCE.NS","ONGC.NS","BPCL.NS","GAIL.NS","IOC.NS",
         "TATAPOWER.NS","ADANIGREEN.NS","ADANIENSOL.NS","ADANIPOWER.NS",
-        "NTPC.NS","POWERGRID.NS","ENRIN.NS","SOLARINDS.NS",
-        "JIOFIN.NS",
+        "NTPC.NS","POWERGRID.NS","SOLARINDS.NS",
     ]},
-    # Auto & Auto Ancillary
     **{s: "^CNXAUTO" for s in [
         "MARUTI.NS","BAJAJ-AUTO.NS","M&M.NS","EICHERMOT.NS",
-        "TVSMOTOR.NS","MOTHERSON.NS","BOSCHLTD.NS","TMCV.NS",
-        "TMPV.NS","HYUNDAI.NS","CUMMINSIND.NS",
+        "TVSMOTOR.NS","MOTHERSON.NS","BOSCHLTD.NS","CUMMINSIND.NS",
     ]},
-    # Pharma & Healthcare
     **{s: "^CNXPHARMA" for s in [
         "SUNPHARMA.NS","DRREDDY.NS","CIPLA.NS","DIVISLAB.NS",
         "TORNTPHARM.NS","APOLLOHOSP.NS","ZYDUSLIFE.NS","MAXHEALTH.NS",
     ]},
-    # Metals & Mining
     **{s: "^CNXMETAL" for s in [
         "JSWSTEEL.NS","TATASTEEL.NS","HINDALCO.NS","VEDL.NS",
         "COALINDIA.NS","HINDZINC.NS","JINDALSTEL.NS",
     ]},
-    # FMCG & Retail
     **{s: "^CNXFMCG" for s in [
         "HINDUNILVR.NS","ITC.NS","NESTLEIND.NS","BRITANNIA.NS",
         "TATACONSUM.NS","GODREJCP.NS","VBL.NS","UNITDSPR.NS",
     ]},
-    # Infra, Capital Goods & Defence
     **{s: "^CNXINFRA" for s in [
         "LT.NS","ADANIENT.NS","ADANIPORTS.NS","BEL.NS","HAL.NS",
         "SIEMENS.NS","ABB.NS","CGPOWER.NS","MAZDOCK.NS",
         "DLF.NS","LODHA.NS","BHARTIARTL.NS",
     ]},
-    # Cement & Construction Materials / Consumer Discretionary
     **{s: "^CNXCONSUM" for s in [
         "ULTRACEMCO.NS","GRASIM.NS","AMBUJACEM.NS","SHREECEM.NS",
         "ASIANPAINT.NS","PIDILITIND.NS",
@@ -330,9 +330,7 @@ INDIA_SECTOR_MAP = {
     ]},
 }
 
-# Friendly display labels for sector ETF/index codes
 SECTOR_LABEL_MAP = {
-    # USA sectors
     "XLK": "Technology",
     "XLF": "Financials",
     "XLV": "Healthcare",
@@ -342,7 +340,6 @@ SECTOR_LABEL_MAP = {
     "XLI": "Industrials",
     "XLC": "Comm. Services",
     "XLB": "Materials",
-    # India sectors
     "^NSEBANK": "Banking",
     "NIFTY_FIN_SERVICE.NS": "Fin. Services",
     "^CNXIT": "IT",
@@ -360,13 +357,12 @@ def get_sector(ticker, exchange):
     if exchange == "NYSE":
         code = USA_SECTOR_MAP.get(ticker)
     else:
-        # Try bare ticker and .NS suffix variants
         code = INDIA_SECTOR_MAP.get(ticker + ".NS") or INDIA_SECTOR_MAP.get(ticker)
     if code:
         return SECTOR_LABEL_MAP.get(code, code)
     return "—"
 
-# Assign each stock a synthetic chart pattern + breakout direction
+# ── Synthetic pattern pool ────────────────────────────────────────────────────
 PATTERNS = [
     "downtrend","uptrend","channel_up","channel_down","triangle_sym",
     "triangle_asc","triangle_desc","wedge_rise","wedge_fall","consolidation",
@@ -381,7 +377,6 @@ DIRS = [
     "down","up","up","down","up","up","up","down","down","up",
 ]
 
-# ── Synthetic OHLCV Generator ─────────────────────────────────────────────────
 # ── Live Data via yfinance (with synthetic fallback) ─────────────────────────
 _yf_cache = {}
 
@@ -392,18 +387,15 @@ def fetch_yf(yf_ticker, period="6mo"):
     try:
         import io, sys
         _stderr = sys.stderr
-        sys.stderr = io.StringIO()   # swallow yfinance stderr chatter
+        sys.stderr = io.StringIO()
         try:
             df = yf.Ticker(yf_ticker).history(period=period, auto_adjust=True)
         finally:
-            sys.stderr = _stderr     # always restore
+            sys.stderr = _stderr
         if df is None or len(df) < 30:
             _yf_cache[yf_ticker] = None
             return None
         df = df[["Open","High","Low","Close","Volume"]].copy()
-        # FIX A: yfinance returns timezone-aware DatetimeIndex (e.g. UTC).
-        # tz_localize(None) raises TypeError on tz-aware indexes — use tz_convert(None)
-        # to strip timezone safely; only tz_localize when index is already naive.
         idx = pd.to_datetime(df.index)
         df.index = idx.tz_convert(None) if idx.tz is not None else idx
         _yf_cache[yf_ticker] = df
@@ -460,10 +452,6 @@ def inject_breakout(df, direction="up"):
     ar = (df["High"] - df["Low"]).mean()
     df["Volume"] = df["Volume"].astype(float)
     for i in range(-3, 0):
-        # FIX 1: Cache the original close BEFORE modifying it so that High/Low
-        # are computed from the pre-modification value, not the already-mutated one.
-        # Bug was: High = (orig + ar*1.8) + ar*2.2 = orig + ar*4.0 (wrong).
-        # Fixed:   High = orig + ar*2.2 (correct).
         orig_close = float(df["Close"].iloc[i])
         orig_vol   = float(df["Volume"].iloc[i])
         if direction == "up":
@@ -510,14 +498,11 @@ def find_pivots(series, order=5):
 #  ALL 20 TRENDLINE DETECTORS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# ── Helper: Make result dict ──────────────────────────────────────────────────
-# FIX 7: Moved mk() to before the first checker function that calls it.
-# Previously defined at the bottom (line ~917) — after 400+ lines of callers.
-# Not a runtime error in Python, but a readability/maintenance hazard.
 def mk(type_, signal, num, detail, tl):
     return {"type": type_, "signal": signal, "num": num, "detail": detail, "tl": round(float(tl), 2)}
 
 
+# ── 1. Uptrend Line ───────────────────────────────────────────────────────────
 def check_uptrend_line(df):
     _, lows = find_pivots(df["Low"])
     if len(lows) < 2: return None
@@ -587,9 +572,7 @@ def check_triangle(df):
     (li1, lv1), (li2, lv2) = pl[-2], pl[-1]
     us = (hv2 - hv1) / max(hi2 - hi1, 1)
     ls = (lv2 - lv1) / max(li2 - li1, 1)
-    # FIX 2: Also filter descending channels (us<0 and ls<0).
-    # Original code only filtered ascending channels, letting descending
-    # channels (both slopes negative) generate false triangle signals.
+    # Filter out pure channels (both slopes same direction)
     if (us > 0 and ls > 0) or (us < 0 and ls < 0): return None
     n = len(df) - 1
     upper = hv2 + us * (n - hi2)
@@ -626,7 +609,8 @@ def check_wedge(df):
                   "Rising wedge breakdown — overbought reversal, both lines slope up", lower)
 
 # ── 7. Flag & Pennant ─────────────────────────────────────────────────────────
-def check_flag_pennant(df):
+# FIX-13: pole_move threshold is now exchange-aware (7% NSE, 4% NYSE)
+def check_flag_pennant(df, exchange="NSE"):
     n = len(df)
     if n < 30: return None
     pole = df.iloc[-30:-15]
@@ -635,25 +619,29 @@ def check_flag_pennant(df):
     flag_high = float(flag["High"].max())
     flag_low  = float(flag["Low"].min())
     flag_range = (flag_high - flag_low) / max(float(flag["Close"].mean()), 0.001)
-    cur = float(df["Close"].iloc[-1])
+    cur  = float(df["Close"].iloc[-1])
     prev = float(df["Close"].iloc[-2])
-    if pole_move > 0.04 and flag_range < 0.05 and cur > flag_high * 1.005 and prev <= flag_high:
+    # FIX-13: NSE stocks are high-beta; require a stronger pole move
+    min_pole = 0.07 if exchange == "NSE" else 0.04
+    if pole_move > min_pole and flag_range < 0.06 and cur > flag_high * 1.005 and prev <= flag_high:
         return mk("Bull Flag / Pennant Breakout", "BULLISH", "7",
                   f"Flag breakout after +{pole_move*100:.1f}% pole — tight consolidation broken upward", flag_high)
-    if pole_move < -0.04 and flag_range < 0.05 and cur < flag_low * 0.995 and prev >= flag_low:
+    if pole_move < -min_pole and flag_range < 0.06 and cur < flag_low * 0.995 and prev >= flag_low:
         return mk("Bear Flag Breakdown", "BEARISH", "7",
                   f"Bear flag breakdown after {pole_move*100:.1f}% pole — continuation lower", flag_low)
 
 # ── 8. Fan Lines ──────────────────────────────────────────────────────────────
 def check_fan_lines(df):
     _, lows = find_pivots(df["Low"], order=8)
-    # FIX 4: Need at least 4 lows: 1 origin + 3 subsequent to build 3 fan slopes.
-    # Original guard (< 3) allowed only 2 slopes through, then bailed later anyway.
     if len(lows) < 4: return None
-    oi, ov = lows[0]
+    # FIX: Use most significant swing low (largest drop to it) as origin, not oldest
+    # Find the lowest pivot in the list as the fan origin
+    oi, ov = min(lows, key=lambda x: x[1])
     n = len(df) - 1
-    slopes = [(v - ov) / max(i - oi, 1) for i, v in lows[1:4]]
-    if len(slopes) < 3: return None
+    # Only use lows that come AFTER the origin
+    subsequent = [(i, v) for i, v in lows if i > oi]
+    if len(subsequent) < 3: return None
+    slopes = [(v - ov) / max(i - oi, 1) for i, v in subsequent[:3]]
     fan1 = ov + slopes[0] * (n - oi)
     fan2 = ov + slopes[1] * (n - oi)
     fan3 = ov + slopes[2] * (n - oi)
@@ -666,11 +654,13 @@ def check_fan_lines(df):
                   "Price broke above first fan line — early trend recovery signal", fan1)
 
 # ── 9. Internal Trendline ─────────────────────────────────────────────────────
+# FIX-06: regression limited to last 50 bars (was entire dataset ~130 bars)
 def check_internal_trendline(df):
-    bodies = ((df["Open"] + df["Close"]) / 2).values
-    x = np.arange(len(bodies))
+    lookback = min(50, len(df))
+    bodies = ((df["Open"] + df["Close"]) / 2).values[-lookback:]
+    x = np.arange(lookback)
     sl, ic = np.polyfit(x, bodies, 1)
-    n = len(bodies) - 1
+    n = lookback - 1
     proj      = sl * n + ic
     prev_proj = sl * (n - 1) + ic
     cur, prev = float(df["Close"].iloc[-1]), float(df["Close"].iloc[-2])
@@ -704,13 +694,12 @@ def check_neckline(df):
     highs, lows = highs[0], lows[1]
     cur, prev = float(df["Close"].iloc[-1]), float(df["Close"].iloc[-2])
 
-    # Inverse H&S (3 lows: left shoulder, head, right shoulder)
+    # Inverse H&S
     if len(lows) >= 3:
         ls_i, ls_v = lows[-3]
-        h_i,  h_v  = lows[-2]  # head = lowest
+        h_i,  h_v  = lows[-2]
         rs_i, rs_v = lows[-1]
         if h_v < ls_v and h_v < rs_v and abs(ls_v - rs_v) / max(ls_v, 0.001) < 0.05:
-            # Neckline = average of the highs between shoulders
             mid_highs = [v for i, v in highs if ls_i < i < rs_i]
             if mid_highs:
                 neckline = sum(mid_highs) / len(mid_highs)
@@ -718,10 +707,10 @@ def check_neckline(df):
                     return mk("Inverse H&S Neckline Breakout", "BULLISH", "11",
                               f"Classic Inverse Head & Shoulders — neckline at {neckline:.2f} broken upward", neckline)
 
-    # H&S (3 highs: left shoulder, head, right shoulder)
+    # H&S
     if len(highs) >= 3:
         ls_i, ls_v = highs[-3]
-        h_i,  h_v  = highs[-2]  # head = highest
+        h_i,  h_v  = highs[-2]
         rs_i, rs_v = highs[-1]
         if h_v > ls_v and h_v > rs_v and abs(ls_v - rs_v) / max(ls_v, 0.001) < 0.05:
             mid_lows = [v for i, v in lows if ls_i < i < rs_i]
@@ -732,6 +721,7 @@ def check_neckline(df):
                               f"Classic Head & Shoulders — neckline at {neckline:.2f} broken downward", neckline)
 
 # ── 12. Fibonacci Trendline ───────────────────────────────────────────────────
+# FIX-09: EMA slope filter added — only fire Fib signals aligned with EMA trend direction
 def check_fibonacci_trendline(df):
     recent = df.tail(60)
     swing_high = float(recent["High"].max())
@@ -745,41 +735,56 @@ def check_fibonacci_trendline(df):
         "78.6%": swing_high - diff * 0.786,
     }
     cur, prev = float(df["Close"].iloc[-1]), float(df["Close"].iloc[-2])
+
+    # FIX-09: Determine trend direction via EMA50 slope
+    ema50 = df["Close"].ewm(span=50, adjust=False).mean()
+    ema_slope_up = float(ema50.iloc[-1]) > float(ema50.iloc[-5])  # rising over last 5 bars
+
     for label, level in fib_levels.items():
-        if prev < level * 0.998 and cur > level * 1.005:
+        # Bullish Fib bounce: only fire when trend is up (EMA rising)
+        if ema_slope_up and prev < level * 0.998 and cur > level * 1.005:
             return mk(f"Fibonacci {label} Breakout", "BULLISH", "12",
-                      f"Price broke above Fib {label} retracement level at {level:.2f}", level)
-        if prev > level * 1.002 and cur < level * 0.995:
+                      f"Price broke above Fib {label} retracement level at {level:.2f} — uptrend aligned", level)
+        # Bearish Fib rejection: only fire when trend is down (EMA falling)
+        if not ema_slope_up and prev > level * 1.002 and cur < level * 0.995:
             return mk(f"Fibonacci {label} Breakdown", "BEARISH", "12",
-                      f"Price broke below Fib {label} support level at {level:.2f}", level)
+                      f"Price broke below Fib {label} support level at {level:.2f} — downtrend aligned", level)
 
 # ── 13. Pitchfork / Andrews Pitchfork ────────────────────────────────────────
+# FIX-05: All pivot candidates are sorted by bar-index before A/B/C assignment
 def check_pitchfork(df):
     highs, lows = find_pivots(df["High"], order=10), find_pivots(df["Low"], order=10)
     highs, lows = highs[0], lows[1]
-    # FIX E: Guard updated from < 1 to < 2 — we access highs[-2] below, so at
-    # least 2 highs are required. Also replaced bare except with logged except.
     if len(highs) < 2 or len(lows) < 2: return None
-    # Pivot A = first swing high, B = next swing low, C = next swing high
-    # FIX 3: Andrews Pitchfork requires A=high, B=low, C=high.
-    # Original code used lows[-1] for C, making both B and C lows,
-    # which produces an incorrect and meaningless median line.
     try:
-        A_i, A_v = highs[-2]
-        B_i, B_v = lows[-2]
-        C_i, C_v = highs[-1]   # was lows[-1] — must be a pivot HIGH
+        # Merge all pivots, tag type, sort chronologically
+        all_pivots = [("H", i, v) for i, v in highs] + [("L", i, v) for i, v in lows]
+        all_pivots.sort(key=lambda x: x[1])
+        # Need at least 3 alternating pivots: H-L-H or L-H-L pattern
+        # Andrews Pitchfork: A=first pivot, B=second pivot, C=third pivot
+        # Best is: A=high, B=low, C=high (bullish pitchfork)
+        # Find last H-L-H sequence
+        A_t = A_i = A_v = B_t = B_i = B_v = C_t = C_i = C_v = None
+        for k in range(len(all_pivots) - 2):
+            t1, i1, v1 = all_pivots[k]
+            t2, i2, v2 = all_pivots[k+1]
+            t3, i3, v3 = all_pivots[k+2]
+            if t1 == "H" and t2 == "L" and t3 == "H":
+                A_t, A_i, A_v = t1, i1, v1
+                B_t, B_i, B_v = t2, i2, v2
+                C_t, C_i, C_v = t3, i3, v3
+        if A_i is None: return None
+        if not (A_i < B_i < C_i): return None
     except Exception as e:
         logging.debug(f"check_pitchfork pivot unpacking failed: {e}")
         return None
-    if not (A_i < B_i < C_i): return None
-    # Median line: from A through midpoint of B-C
     mid_bc_v = (B_v + C_v) / 2
     mid_bc_i = (B_i + C_i) / 2
     ml_slope = (mid_bc_v - A_v) / max(mid_bc_i - A_i, 1)
     n = len(df) - 1
-    median_val = A_v + ml_slope * (n - A_i)
-    cur, prev = float(df["Close"].iloc[-1]), float(df["Close"].iloc[-2])
+    median_val  = A_v + ml_slope * (n - A_i)
     prev_median = A_v + ml_slope * (n - 1 - A_i)
+    cur, prev = float(df["Close"].iloc[-1]), float(df["Close"].iloc[-2])
     if prev <= prev_median * 1.005 and cur > median_val * 1.01:
         return mk("Pitchfork Median Line Breakout", "BULLISH", "13",
                   f"Price broke above Andrews Pitchfork median line — bullish acceleration", median_val)
@@ -788,6 +793,8 @@ def check_pitchfork(df):
                   f"Price broke below Andrews Pitchfork median line — bearish shift", median_val)
 
 # ── 14. Linear Regression Channel ────────────────────────────────────────────
+# FIX-03: Description corrected — kept momentum breakout interpretation (upper=BULL, lower=BEAR)
+#         and fixed misleading "mean reversion exhausted" wording on lower breakdown
 def check_regression_channel(df):
     n = min(50, len(df))
     closes = df["Close"].values[-n:]
@@ -797,18 +804,19 @@ def check_regression_channel(df):
     std = residuals.std()
     upper_band = sl * (n - 1) + ic + 2 * std
     lower_band = sl * (n - 1) + ic - 2 * std
-    # FIX D: Removed unused `center` variable — it was computed but never referenced.
     cur, prev  = float(df["Close"].iloc[-1]), float(df["Close"].iloc[-2])
     prev_upper = sl * (n - 2) + ic + 2 * std
     prev_lower = sl * (n - 2) + ic - 2 * std
     if prev <= prev_upper * 1.005 and cur > upper_band * 1.01:
         return mk("Regression Channel Upper Breakout", "BULLISH", "14",
-                  f"Price broke above 2σ upper regression band — parabolic extension possible", upper_band)
+                  f"Broke above 2σ upper regression band — strong momentum, parabolic extension possible", upper_band)
+    # FIX-03: Description corrected — "breakdown below lower band" not "mean reversion exhausted"
     if prev >= prev_lower * 0.995 and cur < lower_band * 0.99:
         return mk("Regression Channel Lower Breakdown", "BEARISH", "14",
-                  f"Price broke below 2σ lower regression band — mean reversion exhausted", lower_band)
+                  f"Broke below 2σ lower regression band — accelerating sell-off below lower channel", lower_band)
 
 # ── 15. Acceleration / Parabolic Trendline ───────────────────────────────────
+# FIX-07: Correlation threshold lowered 0.90→0.80; residual relaxed to 2-of-3
 def check_acceleration(df):
     n = 20
     if len(df) < n: return None
@@ -816,89 +824,95 @@ def check_acceleration(df):
     x = np.arange(n)
     sl, ic = np.polyfit(x, closes, 1)
     residuals = closes - (sl * x + ic)
-    # Parabolic: slope very steep + last few residuals strongly positive
     r_corr = np.corrcoef(x, closes)[0, 1]
     recent_resid = residuals[-5:]
     projected = sl * (n - 1) + ic
-    cur, prev  = float(df["Close"].iloc[-1]), float(df["Close"].iloc[-2])
-    if r_corr > 0.90 and sl > 0 and all(r > 0 for r in recent_resid[-3:]):
+    # FIX-07: threshold 0.90→0.80, and 2-of-3 last residuals (not all 3)
+    if r_corr > 0.80 and sl > 0 and sum(1 for r in recent_resid[-3:] if r > 0) >= 2:
         return mk("Parabolic Acceleration Breakout", "BULLISH", "15",
                   f"Price accelerating above regression — parabolic up-move (R={r_corr:.2f}, slope={sl:.2f}/day)", projected)
-    if r_corr < -0.90 and sl < 0 and all(r < 0 for r in recent_resid[-3:]):
+    if r_corr < -0.80 and sl < 0 and sum(1 for r in recent_resid[-3:] if r < 0) >= 2:
         return mk("Parabolic Deceleration Breakdown", "BEARISH", "15",
                   f"Price accelerating below regression — parabolic downmove (R={r_corr:.2f})", projected)
 
 # ── 16. Base Trendline (Accumulation Floor) ───────────────────────────────────
-def check_base_trendline(df):
+# FIX-04: Added missing BEARISH base failure signal
+# FIX-12: base_range threshold is exchange-aware (0.20 NSE, 0.15 NYSE)
+def check_base_trendline(df, exchange="NSE"):
     if len(df) < 40: return None
-    base_zone = df.tail(40)
+    base_zone  = df.tail(40)
     low_floor  = float(base_zone["Low"].quantile(0.10))
     high_roof  = float(base_zone["High"].quantile(0.90))
     base_range = (high_roof - low_floor) / max(float(base_zone["Close"].mean()), 0.001)
     cur, prev  = float(df["Close"].iloc[-1]), float(df["Close"].iloc[-2])
-    # Valid base: tight range < 15% over 40 bars
-    if base_range < 0.15:
+    # FIX-12: NSE high-beta stocks have wider natural ranges
+    max_range = 0.20 if exchange == "NSE" else 0.15
+    if base_range < max_range:
         if prev <= high_roof * 1.005 and cur > high_roof * 1.015:
             return mk("Base Trendline Breakout (Accumulation)", "BULLISH", "16",
                       f"Price broke out of 40-bar accumulation base — strong institutional buying", high_roof)
+        # FIX-04: Bearish base failure — breakdown below base floor
+        if prev >= low_floor * 0.995 and cur < low_floor * 0.985:
+            return mk("Base Trendline Failure (Distribution)", "BEARISH", "16",
+                      f"Price broke below 40-bar base floor at {low_floor:.2f} — distribution/panic selling", low_floor)
 
 # ── 17. Role Reversal / Polarity Flip ────────────────────────────────────────
+# FIX-11: Proximity band widened from 2% to 3%
 def check_role_reversal(df):
     highs, lows = find_pivots(df["High"], order=8), find_pivots(df["Low"], order=8)
     highs, lows = highs[0], lows[1]
     cur, prev = float(df["Close"].iloc[-1]), float(df["Close"].iloc[-2])
-    # Old resistance becoming support: recent low retests old pivot high
+    # Old resistance becoming support
     if len(highs) >= 2:
         old_res_i, old_res_v = highs[-2]
-        # Price previously broke above old resistance, now retesting from above
         recent_min = float(df["Close"].tail(10).min())
-        if (recent_min >= old_res_v * 0.98 and recent_min <= old_res_v * 1.02
+        # FIX-11: band widened 2%→3%
+        if (recent_min >= old_res_v * 0.97 and recent_min <= old_res_v * 1.03
                 and cur > old_res_v * 1.01 and prev <= old_res_v * 1.01):
             return mk("Role Reversal — Old Resistance Now Support", "BULLISH", "17",
                       f"Polarity flip: old resistance {old_res_v:.2f} held as support → bullish continuation", old_res_v)
-    # Old support becoming resistance: price retests broken support from below
+    # Old support becoming resistance
     if len(lows) >= 2:
         old_sup_i, old_sup_v = lows[-2]
         recent_max = float(df["Close"].tail(10).max())
-        if (recent_max >= old_sup_v * 0.98 and recent_max <= old_sup_v * 1.02
+        # FIX-11: band widened 2%→3%
+        if (recent_max >= old_sup_v * 0.97 and recent_max <= old_sup_v * 1.03
                 and cur < old_sup_v * 0.99 and prev >= old_sup_v * 0.99):
             return mk("Role Reversal — Old Support Now Resistance", "BEARISH", "17",
                       f"Polarity flip: old support {old_sup_v:.2f} now acting as resistance → bearish continuation", old_sup_v)
 
 # ── 18. Speed Resistance Lines ────────────────────────────────────────────────
+# FIX-08: 2/3 level checked before 1/3 — stronger breakdown/recovery checked first
 def check_speed_resistance(df):
     recent = df.tail(60)
     swing_high = float(recent["High"].max())
     swing_low  = float(recent["Low"].min())
     diff = swing_high - swing_low
-    srl_33 = swing_high - diff * (1 / 3)  # 1/3 line
-    srl_67 = swing_high - diff * (2 / 3)  # 2/3 line
+    srl_33 = swing_high - diff * (1 / 3)  # 1/3 line (higher)
+    srl_67 = swing_high - diff * (2 / 3)  # 2/3 line (lower, stronger signal)
     cur, prev = float(df["Close"].iloc[-1]), float(df["Close"].iloc[-2])
-    if prev > srl_33 * 0.998 and cur < srl_33 * 0.992:
-        return mk("Speed Resistance 1/3 Line Break", "BEARISH", "18",
-                  f"Broke below 1/3 Speed Resistance Line at {srl_33:.2f} — correction deepening", srl_33)
+    # FIX-08: Check stronger 2/3 first
     if prev > srl_67 * 0.998 and cur < srl_67 * 0.992:
         return mk("Speed Resistance 2/3 Line Break", "BEARISH", "18",
                   f"Broke below 2/3 Speed Resistance Line at {srl_67:.2f} — major support lost", srl_67)
+    if prev > srl_33 * 0.998 and cur < srl_33 * 0.992:
+        return mk("Speed Resistance 1/3 Line Break", "BEARISH", "18",
+                  f"Broke below 1/3 Speed Resistance Line at {srl_33:.2f} — correction deepening", srl_33)
     if prev < srl_33 * 1.002 and cur > srl_33 * 1.008:
         return mk("Speed Resistance 1/3 Line Recovery", "BULLISH", "18",
                   f"Recovered above 1/3 Speed Resistance Line at {srl_33:.2f} — trend resuming", srl_33)
-    # FIX F: Added missing 2/3 line bullish recovery signal — the bearish 2/3
-    # breakdown had no matching bullish counterpart, causing an asymmetric detector.
     if prev < srl_67 * 1.002 and cur > srl_67 * 1.008:
         return mk("Speed Resistance 2/3 Line Recovery", "BULLISH", "18",
                   f"Recovered above 2/3 Speed Resistance Line at {srl_67:.2f} — major support reclaimed", srl_67)
 
 # ── 19. Candlestick Body Trendline (No-Wick) ─────────────────────────────────
 def check_body_trendline(df):
-    # Use body high (max of open/close) and body low (min of open/close)
     body_highs = df[["Open", "Close"]].max(axis=1)
     body_lows  = df[["Open", "Close"]].min(axis=1)
     bh_pivots, bl_pivots = find_pivots(body_highs, order=5), find_pivots(body_lows, order=5)
     bh_pivots, bl_pivots = bh_pivots[0], bl_pivots[1]
     cur, prev = float(df["Close"].iloc[-1]), float(df["Close"].iloc[-2])
 
-    # Body downtrend line (lower body highs)
     if len(bh_pivots) >= 2:
         (i1, v1), (i2, v2) = bh_pivots[-2], bh_pivots[-1]
         if v2 < v1:
@@ -907,7 +921,6 @@ def check_body_trendline(df):
                 return mk("Body Trendline Breakout (No-Wick)", "BULLISH", "19",
                           f"Broke above candle-body downtrend line (wick-filtered) at {proj:.2f}", proj)
 
-    # Body uptrend line (higher body lows)
     if len(bl_pivots) >= 2:
         (i1, v1), (i2, v2) = bl_pivots[-2], bl_pivots[-1]
         if v2 > v1:
@@ -917,47 +930,44 @@ def check_body_trendline(df):
                           f"Broke below candle-body uptrend line (wick-filtered) at {proj:.2f}", proj)
 
 # ── 20. Gann Angle (1×1 = 45°) ───────────────────────────────────────────────
+# FIX-02: unit = origin_v * 0.001 (was /100 = 1% per bar — 100× too aggressive)
 def check_gann_angle(df):
     if len(df) < 30: return None
-    # Find most recent significant swing low as Gann origin
     _, lows = find_pivots(df["Low"], order=10)
     if not lows: return None
     origin_i, origin_v = lows[-1]
     n = len(df) - 1
-    # Gann 1×1: price should move 1 unit per 1 bar (45°)
-    # Normalize: 1 unit = 1/100 of the origin price per bar
-    unit = origin_v / 100
-    gann_1x1 = origin_v + unit * (n - origin_i)
-    # FIX 6: Removed dead-code variables gann_2x1 and gann_1x2 — they were
-    # computed but never referenced anywhere in the function.
-    cur, prev = float(df["Close"].iloc[-1]), float(df["Close"].iloc[-2])
+    # FIX-02: Gann 1×1 unit = 0.1% of origin per bar (realistic for daily charts)
+    unit = origin_v * 0.001
+    gann_1x1  = origin_v + unit * (n - origin_i)
     prev_gann = origin_v + unit * (n - 1 - origin_i)
-
+    cur, prev = float(df["Close"].iloc[-1]), float(df["Close"].iloc[-2])
     if prev <= prev_gann * 1.005 and cur > gann_1x1 * 1.01:
         return mk("Gann 1×1 Angle Breakout (45°)", "BULLISH", "20",
-                  f"Price broke above Gann 1×1 angle (45°) from origin {origin_v:.2f} — trend acceleration", gann_1x1)
+                  f"Price broke above Gann 1×1 angle from origin {origin_v:.2f} — trend acceleration", gann_1x1)
     if prev >= prev_gann * 0.995 and cur < gann_1x1 * 0.99:
         return mk("Gann 1×1 Angle Breakdown (45°)", "BEARISH", "20",
-                  f"Price fell below Gann 1×1 angle (45°) from origin {origin_v:.2f} — trend weakening", gann_1x1)
+                  f"Price fell below Gann 1×1 angle from origin {origin_v:.2f} — trend weakening", gann_1x1)
 
 # ── Category mapper ───────────────────────────────────────────────────────────
 TL_CATEGORIES = {
-    "1": "Uptrend Line",      "2": "Downtrend Line",   "3": "Horizontal",
-    "4": "Channel",           "5": "Triangle",          "6": "Wedge",
-    "7": "Flag & Pennant",    "8": "Fan Lines",         "9": "Internal TL",
-    "10": "Dynamic EMA",      "11": "Neckline (H&S)",  "12": "Fibonacci TL",
-    "13": "Pitchfork",        "14": "Regression Ch.",  "15": "Acceleration",
-    "16": "Base TL",          "17": "Role Reversal",   "18": "Speed Resistance",
-    "19": "Body TL",          "20": "Gann Angle",
+    "1": "Uptrend Line",     "2": "Downtrend Line",  "3": "Horizontal",
+    "4": "Channel",          "5": "Triangle",          "6": "Wedge",
+    "7": "Flag & Pennant",   "8": "Fan Lines",         "9": "Internal TL",
+    "10": "Dynamic EMA",     "11": "Neckline (H&S)",  "12": "Fibonacci TL",
+    "13": "Pitchfork",       "14": "Regression Ch.",  "15": "Acceleration",
+    "16": "Base TL",         "17": "Role Reversal",   "18": "Speed Resistance",
+    "19": "Body TL",         "20": "Gann Angle",
 }
 
 # Single-result detectors (return one result or None)
+# Note: check_flag_pennant and check_base_trendline need exchange arg — handled in scan_stock
 SINGLE_CHECKERS = [
     check_uptrend_line, check_downtrend_line, check_horizontal,
-    check_channel, check_triangle, check_wedge, check_flag_pennant,
+    check_channel, check_triangle, check_wedge,
     check_fan_lines, check_internal_trendline, check_neckline,
     check_fibonacci_trendline, check_pitchfork, check_regression_channel,
-    check_acceleration, check_base_trendline, check_role_reversal,
+    check_acceleration, check_role_reversal,
     check_speed_resistance, check_body_trendline, check_gann_angle,
 ]
 
@@ -975,15 +985,14 @@ def calc_rsi(df, period=14):
 
 def rsi_zone(rsi):
     """Return zone label and CSS class for RSI value."""
-    if rsi is None:        return "—",        "rz-na"
-    if rsi >= 70:          return "OB",        "rz-ob"   # overbought
-    if rsi <= 30:          return "OS",        "rz-os"   # oversold
-    if rsi >= 60:          return "Strong",    "rz-str"
-    if rsi <= 40:          return "Weak",      "rz-wk"
-    return "Neutral",      "rz-neu"
+    if rsi is None:   return "—",       "rz-na"
+    if rsi >= 70:     return "OB",      "rz-ob"
+    if rsi <= 30:     return "OS",      "rz-os"
+    if rsi >= 60:     return "Strong",  "rz-str"
+    if rsi <= 40:     return "Weak",    "rz-wk"
+    return "Neutral", "rz-neu"
 
-# ── Sector RSI (live via yfinance, synthetic fallback) ───────────────────────
-# Fallback base prices used ONLY when yfinance is unavailable
+# ── Sector RSI ───────────────────────────────────────────────────────────────
 SECTOR_BASE_PRICES = {
     "XLK": 225.40, "XLF": 42.80,  "XLV": 138.60, "XLP": 74.20,
     "XLY": 192.50, "XLE": 88.30,  "XLI": 128.40, "XLC": 82.10,
@@ -998,22 +1007,15 @@ SECTOR_BASE_PRICES = {
 _sector_rsi_cache = {}
 
 def get_sector_rsi(sector_code):
-    """
-    Fetch real daily RSI(14) for a sector ETF/index via yfinance.
-    Falls back to synthetic Gaussian walk if yfinance unavailable.
-    """
     if sector_code in _sector_rsi_cache:
         return _sector_rsi_cache[sector_code]
-
-    # ── Live path ──────────────────────────────────────────────
     if YF_AVAILABLE:
         df_s = fetch_yf(sector_code, period="3mo")
         if df_s is not None and len(df_s) >= 15:
             rsi_val = calc_rsi(df_s)
             _sector_rsi_cache[sector_code] = rsi_val
             return rsi_val
-
-    # ── Synthetic fallback ─────────────────────────────────────
+    # Synthetic fallback
     base = SECTOR_BASE_PRICES.get(sector_code)
     if base is None:
         _sector_rsi_cache[sector_code] = None
@@ -1048,6 +1050,36 @@ def get_sector_rsi_for_ticker(ticker, exchange):
     return rsi_val, code
 
 
+# ── Deduplication helper ──────────────────────────────────────────────────────
+# FIX-10: Keep at most MAX_PER_DIRECTION signals per direction per stock.
+#         Within each direction bucket, prefer lower-numbered (more classical) detectors.
+MAX_PER_DIRECTION = 2
+
+def deduplicate_signals(results):
+    """
+    From a list of signals for a single stock, keep at most MAX_PER_DIRECTION
+    bullish and MAX_PER_DIRECTION bearish signals.
+    Priority: lower trendline number = more classical = higher priority.
+    Within the same number, keep only 1 (e.g. one EMA crossover direction).
+    """
+    bull = [r for r in results if r["signal"] == "BULLISH"]
+    bear = [r for r in results if r["signal"] == "BEARISH"]
+
+    def _pick(signals, max_keep):
+        # Sort by num (string "1"..."20" — sort numerically)
+        signals.sort(key=lambda r: int(r["num"]))
+        # De-dup by num: keep first occurrence of each num
+        seen_nums = set()
+        unique = []
+        for s in signals:
+            if s["num"] not in seen_nums:
+                seen_nums.add(s["num"])
+                unique.append(s)
+        return unique[:max_keep]
+
+    return _pick(bull, MAX_PER_DIRECTION) + _pick(bear, MAX_PER_DIRECTION)
+
+
 def scan_stock(ticker, name, base_price, idx, exchange):
     df = fetch_data(ticker, base_price, idx, exchange=exchange)
     cur  = float(df["Close"].iloc[-1])
@@ -1073,6 +1105,7 @@ def scan_stock(ticker, name, base_price, idx, exchange):
 
     results = []
 
+    # Run all single-result checkers
     for fn in SINGLE_CHECKERS:
         try:
             r = fn(df)
@@ -1080,8 +1113,19 @@ def scan_stock(ticker, name, base_price, idx, exchange):
                 r.update({**base_info, "category": TL_CATEGORIES.get(r["num"], "Other")})
                 results.append(r)
         except Exception as e:
-            # FIX 5: Log instead of silently swallowing — bare except:pass was
-            # hiding real programming errors (KeyError, AttributeError, etc.)
+            logging.debug(f"[{ticker}] {fn.__name__} failed: {e}")
+
+    # Exchange-aware checkers (need exchange argument)
+    for fn, kwargs in [
+        (check_flag_pennant,   {"exchange": exchange}),
+        (check_base_trendline, {"exchange": exchange}),
+    ]:
+        try:
+            r = fn(df, **kwargs)
+            if r:
+                r.update({**base_info, "category": TL_CATEGORIES.get(r["num"], "Other")})
+                results.append(r)
+        except Exception as e:
             logging.debug(f"[{ticker}] {fn.__name__} failed: {e}")
 
     # Multi-result: EMA dynamic (returns list)
@@ -1092,13 +1136,13 @@ def scan_stock(ticker, name, base_price, idx, exchange):
     except Exception as e:
         logging.debug(f"[{ticker}] check_ema_dynamic failed: {e}")
 
+    # FIX-10: Deduplicate — max MAX_PER_DIRECTION signals per direction
+    results = deduplicate_signals(results)
+
     return results
 
 
-# ── HTML Builder (Card-based grouped layout) ──────────────────────────────────
-
-# HTML template with %%PLACEHOLDER%% tokens substituted at render time.
-# Using string replacement instead of f-strings avoids escaping every CSS brace.
+# ── HTML Builder ──────────────────────────────────────────────────────────────
 _HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8">
@@ -1186,7 +1230,6 @@ body{background:var(--nb);color:var(--txt);font-family:system-ui,sans-serif;font
 .card.bear{border-left-color:var(--be)}
 .card.mix {border-left-color:var(--mx)}
 
-/* Card header */
 .c-head{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px}
 .c-left{min-width:0}
 .c-ticker{font-family:var(--mono);font-size:15px;font-weight:700;color:#fff;letter-spacing:.3px}
@@ -1202,7 +1245,6 @@ body{background:var(--nb);color:var(--txt);font-family:system-ui,sans-serif;font
 .c-badge.bear{background:rgba(248,113,113,0.15);color:var(--be);border:1px solid rgba(248,113,113,0.35)}
 .c-badge.mix {background:rgba(251,191,36,0.15);color:var(--mx);border:1px solid rgba(251,191,36,0.35)}
 
-/* Price row */
 .c-prow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;
   padding:7px 0;border-top:1px solid rgba(56,163,245,0.12);
   border-bottom:1px solid rgba(56,163,245,0.12);margin-bottom:7px}
@@ -1218,12 +1260,10 @@ body{background:var(--nb);color:var(--txt);font-family:system-ui,sans-serif;font
 .c-vol.vok{color:var(--bu)}
 .c-tl{font-size:10px;color:var(--acc3);font-family:var(--mono)}
 
-/* Signal block wrapper — hidden by default */
 .sig-block{max-height:0;overflow:hidden;opacity:0;
   transition:max-height .28s ease, opacity .2s ease}
 .card.expanded .sig-block{max-height:1000px;opacity:1}
 
-/* Signal rows */
 .sig{display:flex;align-items:baseline;gap:5px;padding:3px 0;
   border-bottom:1px solid rgba(56,163,245,0.08);font-size:11px}
 .sig:last-child{border-bottom:none}
@@ -1234,13 +1274,11 @@ body{background:var(--nb);color:var(--txt);font-family:system-ui,sans-serif;font
 .sig-d{flex-shrink:0;font-size:10px;font-weight:700}
 .sig-d.up{color:var(--bu)}.sig-d.dn{color:var(--be)}
 
-/* Detail text — hidden by default, shown when card has .expanded class */
 .sig-detail{font-size:10px;color:var(--mu);font-style:italic;
   padding:0 0 0 29px;line-height:1.3;max-height:0;overflow:hidden;
   opacity:0;transition:max-height .22s ease, opacity .18s ease, padding .18s ease}
 .card.expanded .sig-detail{max-height:60px;opacity:1;padding:1px 0 4px 29px}
 
-/* Toggle button */
 .c-toggle{display:flex;align-items:center;gap:4px;margin-top:7px;
   padding:3px 9px;border-radius:10px;font-size:10px;font-family:var(--mono);
   font-weight:700;cursor:pointer;border:1px solid var(--bdr);
@@ -1252,7 +1290,6 @@ body{background:var(--nb);color:var(--txt);font-family:system-ui,sans-serif;font
 .c-toggle-arrow{display:inline-block;transition:transform .2s ease;font-size:9px}
 .card.expanded .c-toggle-arrow{transform:rotate(180deg)}
 
-/* TL Coverage Legend */
 .lgnd{margin:14px 0 0;background:rgba(0,0,0,0.2);border:1px solid var(--bdr);
   border-radius:7px;padding:10px 12px}
 .lgt{font-size:9px;letter-spacing:.5px;color:var(--acc3);text-transform:uppercase;
@@ -1266,15 +1303,12 @@ body{background:var(--nb);color:var(--txt);font-family:system-ui,sans-serif;font
   border:1px solid rgba(52,217,123,0.35);border-radius:3px;
   padding:0 5px;font-family:var(--mono);font-size:9px;margin-left:auto}
 
-/* Empty state */
 .empty{text-align:center;color:var(--mu);padding:40px 20px;font-family:var(--mono);font-size:12px}
 
-/* Footer */
 footer{text-align:center;padding:12px;border-top:1px solid var(--bdr);
   color:var(--mu);font-size:10px;font-family:var(--mono);line-height:2}
 footer a{color:var(--acc2);text-decoration:none}
 
-/* ── LIVE CLOCKS ── */
 .clock-wrap{display:flex;align-items:center;gap:10px;font-family:var(--mono)}
 .clock-item{display:flex;flex-direction:column;align-items:center;gap:1px}
 .clock-time{font-size:12px;font-weight:700;color:var(--acc2);letter-spacing:.5px;white-space:nowrap}
@@ -1417,12 +1451,6 @@ function cardDir(sigs){
   var b=0;
   for(var i=0;i<sigs.length;i++){if(sigs[i].signal==='BULLISH')b++;}
   return b===sigs.length?'bull':b===0?'bear':'mix';
-}
-
-function rsiCls(zone){
-  if(zone==='OB')return'ob';if(zone==='OS')return'os';
-  if(zone==='Strong')return'str';if(zone==='Weak')return'wk';
-  return'neu';
 }
 
 function fmtPrice(p,exch){
@@ -1740,13 +1768,12 @@ def generate_html(results, scan_time):
     return html
 
 
-
-
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     scan_time = datetime.now().strftime("%d %b %Y  %H:%M:%S")
     total_stocks = len(NSE_STOCKS) + len(NYSE_STOCKS)
-    print(f"\nTrendBreak Pro  ·  {total_stocks} stocks  ·  20 trendline types  ·  {scan_time}")
+    print(f"\nTrendBreak Pro v2  ·  {total_stocks} stocks  ·  20 trendline types  ·  {scan_time}")
+    print(f"  13 fixes applied — see file header for changelog\n")
 
     all_results = []
     done = 0
