@@ -1,84 +1,227 @@
-name: TrendBreak Scanner
+name: Trendline Breakout Scanner
 
-# ── Triggers ──────────────────────────────────────────────────────────────────
 on:
+  # ── NSE scan: 07:00 PM IST = 13:30 UTC ──────────────────────────────────────
+  # ── NYSE scan: 08:30 PM CST = 02:30 UTC (next day) ─────────────────────────
   schedule:
-    # Run 1 — 4:30 PM IST (11:00 UTC) weekdays
-    #   → NSE has just closed (3:30 PM IST) ✅ full NSE day data
-    #   → NYSE not open yet (opens 2:30 PM UTC / 9:30 AM EST) — uses prev day close
-    - cron: '0 11 * * 1-5'
+    - cron: "30 13 * * 1-5"   # NSE  → Mon–Fri 07:00 PM IST (13:30 UTC)
+    - cron: "30 2  * * 2-6"   # NYSE → Mon–Fri 08:30 PM CST (02:30 UTC +1 day)
 
-    # Run 2 — 2:30 AM IST next day (21:00 UTC) weekdays
-    #   → NSE closed ✅
-    #   → NYSE just closed (4:00 PM EST / 3:00 PM EDT) ✅ full NYSE EOD data
-    - cron: '0 21 * * 1-5'
-
-  # Allows you to run the scan manually from the Actions tab anytime
+  # Allow manual trigger from GitHub Actions UI
   workflow_dispatch:
+    inputs:
+      exchange:
+        description: "Which exchange to scan"
+        required: true
+        default: "both"
+        type: choice
+        options:
+          - nse
+          - nyse
+          - both
+      timeframe:
+        description: "Candle timeframe"
+        required: true
+        default: "1d"
+        type: choice
+        options:
+          - 1d
+          - 1h
+          - 4h
+          - 15m
+          - all
 
-# ── Permissions (needed to commit the HTML back to the repo) ──────────────────
+# ── Permissions needed for GitHub Pages deploy ────────────────────────────────
 permissions:
   contents: write
   pages: write
   id-token: write
 
-# ── Job ───────────────────────────────────────────────────────────────────────
 jobs:
-  scan-and-deploy:
+  # ════════════════════════════════════════════════════════════════════════════
+  # JOB 1 — NSE Scan  (07:00 PM IST)
+  # ════════════════════════════════════════════════════════════════════════════
+  scan-nse:
+    name: "📈 NSE Scan (07:00 PM IST)"
     runs-on: ubuntu-latest
 
+    if: |
+      (github.event_name == 'schedule' && github.event.schedule == '30 13 * * 1-5') ||
+      (github.event_name == 'workflow_dispatch' && (inputs.exchange == 'nse' || inputs.exchange == 'both'))
+
     steps:
-      # 1. Check out your repo
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. Set up Python
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
+          cache: "pip"
 
-      # 3. Cache pip packages so repeat runs are faster
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: ${{ runner.os }}-pip-
-
-      # 4. Install dependencies directly — no requirements.txt needed
       - name: Install dependencies
-        run: pip install yfinance>=0.2.28 pandas>=2.0.0 numpy>=1.24.0
-
-      # 5. Confirm the scanner script is present before running
-      - name: Check scanner script exists
         run: |
-          if [ ! -f trendline_scanner.py ]; then
-            echo "❌ trendline_scanner.py not found in repo root!"
-            echo "Make sure you committed the file. Repo contents:"
-            ls -la
-            exit 1
-          fi
-          echo "✅ trendline_scanner.py found"
+          pip install --upgrade pip
+          pip install yfinance pandas numpy scipy
 
-      # 6. Run the scanner — generates trendline_breakout_report.html
-      - name: Run TrendBreak scanner
-        run: python trendline_scanner.py
+      - name: Run NSE Trendline Scanner
+        run: |
+          python trendline_scanner.py \
+            --timeframe ${{ inputs.timeframe || '1d' }} \
+            --force
+        env:
+          # ── Telegram credentials (from GitHub Secrets) ────────────────────
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          # ── Exchange hint ─────────────────────────────────────────────────
+          SCAN_EXCHANGE: NSE
 
-      # 7. Copy report to docs/index.html  (GitHub Pages serves from /docs)
-      - name: Prepare docs folder
+      - name: Move reports to docs/nse/
+        run: |
+          mkdir -p docs/nse
+          mv *.html docs/nse/ 2>/dev/null || true
+          echo "NSE reports generated:"
+          ls docs/nse/
+
+      - name: Upload NSE reports as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nse-reports-${{ github.run_id }}
+          path: docs/nse/
+          retention-days: 30
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # JOB 2 — NYSE Scan  (08:30 PM CST)
+  # ════════════════════════════════════════════════════════════════════════════
+  scan-nyse:
+    name: "📈 NYSE Scan (08:30 PM CST)"
+    runs-on: ubuntu-latest
+
+    if: |
+      (github.event_name == 'schedule' && github.event.schedule == '30 2 * * 2-6') ||
+      (github.event_name == 'workflow_dispatch' && (inputs.exchange == 'nyse' || inputs.exchange == 'both'))
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install yfinance pandas numpy scipy
+
+      - name: Run NYSE Trendline Scanner
+        run: |
+          python trendline_scanner.py \
+            --timeframe ${{ inputs.timeframe || '1d' }} \
+            --force
+        env:
+          # ── Telegram credentials (from GitHub Secrets) ────────────────────
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          # ── Exchange hint ─────────────────────────────────────────────────
+          SCAN_EXCHANGE: NYSE
+
+      - name: Move reports to docs/nyse/
+        run: |
+          mkdir -p docs/nyse
+          mv *.html docs/nyse/ 2>/dev/null || true
+          echo "NYSE reports generated:"
+          ls docs/nyse/
+
+      - name: Upload NYSE reports as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nyse-reports-${{ github.run_id }}
+          path: docs/nyse/
+          retention-days: 30
+
+  # ════════════════════════════════════════════════════════════════════════════
+  # JOB 3 — Deploy to GitHub Pages
+  # ════════════════════════════════════════════════════════════════════════════
+  deploy-pages:
+    name: "🚀 Deploy Reports to GitHub Pages"
+    runs-on: ubuntu-latest
+    needs: [scan-nse, scan-nyse]
+
+    if: always() && (needs.scan-nse.result == 'success' || needs.scan-nyse.result == 'success')
+
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download NSE reports (if available)
+        uses: actions/download-artifact@v4
+        with:
+          name: nse-reports-${{ github.run_id }}
+          path: docs/nse
+        continue-on-error: true
+
+      - name: Download NYSE reports (if available)
+        uses: actions/download-artifact@v4
+        with:
+          name: nyse-reports-${{ github.run_id }}
+          path: docs/nyse
+        continue-on-error: true
+
+      - name: Generate landing index.html
         run: |
           mkdir -p docs
-          cp trendline_breakout_report.html docs/index.html
-          echo "Report copied to docs/index.html"
+          NOW=$(date -u "+%d %b %Y %H:%M UTC")
+          NSE_LINKS=$(ls docs/nse/*.html 2>/dev/null | xargs -I{} basename {} | \
+            sed 's|.*|<li><a href="nse/\0">\0</a></li>|' || echo "<li>No NSE report yet</li>")
+          NYSE_LINKS=$(ls docs/nyse/*.html 2>/dev/null | xargs -I{} basename {} | \
+            sed 's|.*|<li><a href="nyse/\0">\0</a></li>|' || echo "<li>No NYSE report yet</li>")
+          cat > docs/index.html << HTMLEOF
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="UTF-8">
+            <meta name="viewport" content="width=device-width,initial-scale=1">
+            <title>TrendBreak Pro — Reports</title>
+            <style>
+              body { font-family: 'IBM Plex Mono', monospace; background: #0d0f14;
+                     color: #e8eaf0; padding: 40px 24px; max-width: 780px; margin: auto; }
+              h1   { color: #4c9fff; margin-bottom: 4px; }
+              .sub { color: #555b6a; font-size: 12px; margin-bottom: 32px; }
+              h2   { color: #f5c842; margin-top: 24px; }
+              ul   { list-style: none; padding: 0; }
+              li   { margin: 8px 0; }
+              a    { color: #4c9fff; text-decoration: none; }
+              a:hover { text-decoration: underline; }
+              footer { margin-top: 40px; color: #555b6a; font-size: 10px; }
+            </style>
+          </head>
+          <body>
+            <h1>⚡ TrendBreak Pro</h1>
+            <div class="sub">Last updated: ${NOW} &nbsp;·&nbsp; 20 trendline types</div>
+            <h2>🇮🇳 NSE Reports</h2>
+            <ul>${NSE_LINKS}</ul>
+            <h2>🇺🇸 NYSE Reports</h2>
+            <ul>${NYSE_LINKS}</ul>
+            <footer>⚠ Educational &amp; research purposes only · Not financial advice</footer>
+          </body>
+          </html>
+          HTMLEOF
 
-      # 8. Commit and push the updated report back to main
-      - name: Commit updated report
-        run: |
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add docs/index.html
-          # Only commit if something actually changed
-          git diff --staged --quiet || \
-            git commit -m "📊 Auto scan: $(date -u '+%Y-%m-%d %H:%M UTC')"
-          git push
+      - name: Setup GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
