@@ -1,13 +1,10 @@
 name: Trendline Breakout Scanner
 
 on:
-  # ── NSE scan: 07:00 PM IST = 13:30 UTC ──────────────────────────────────────
-  # ── NYSE scan: 08:30 PM CST = 02:30 UTC (next day) ─────────────────────────
   schedule:
     - cron: "30 13 * * 1-5"   # NSE  → Mon–Fri 07:00 PM IST (13:30 UTC)
     - cron: "30 2  * * 2-6"   # NYSE → Mon–Fri 08:30 PM CST (02:30 UTC +1 day)
 
-  # Allow manual trigger from GitHub Actions UI
   workflow_dispatch:
     inputs:
       exchange:
@@ -31,7 +28,6 @@ on:
           - 15m
           - all
 
-# ── Permissions needed for GitHub Pages deploy ────────────────────────────────
 permissions:
   contents: write
   pages: write
@@ -57,12 +53,17 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
-      - name: Install dependencies
+      - name: Create requirements.txt and install dependencies
         run: |
+          cat > requirements.txt << EOF
+          yfinance>=0.2.40
+          pandas>=2.0.0
+          numpy>=1.26.0
+          scipy>=1.11.0
+          EOF
           pip install --upgrade pip
-          pip install yfinance pandas numpy scipy
+          pip install -r requirements.txt
 
       - name: Run NSE Trendline Scanner
         run: |
@@ -70,10 +71,8 @@ jobs:
             --timeframe ${{ inputs.timeframe || '1d' }} \
             --force
         env:
-          # ── Telegram credentials (from GitHub Secrets) ────────────────────
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          # ── Exchange hint ─────────────────────────────────────────────────
           SCAN_EXCHANGE: NSE
 
       - name: Move reports to docs/nse/
@@ -109,12 +108,17 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: "pip"
 
-      - name: Install dependencies
+      - name: Create requirements.txt and install dependencies
         run: |
+          cat > requirements.txt << EOF
+          yfinance>=0.2.40
+          pandas>=2.0.0
+          numpy>=1.26.0
+          scipy>=1.11.0
+          EOF
           pip install --upgrade pip
-          pip install yfinance pandas numpy scipy
+          pip install -r requirements.txt
 
       - name: Run NYSE Trendline Scanner
         run: |
@@ -122,10 +126,8 @@ jobs:
             --timeframe ${{ inputs.timeframe || '1d' }} \
             --force
         env:
-          # ── Telegram credentials (from GitHub Secrets) ────────────────────
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          # ── Exchange hint ─────────────────────────────────────────────────
           SCAN_EXCHANGE: NYSE
 
       - name: Move reports to docs/nyse/
