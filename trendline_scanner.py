@@ -90,9 +90,6 @@ def load_config():
          (set via GitHub Actions Secrets — preferred for CI)
       2. config.json in the same directory as this script
          (used for local runs)
-
-    Returns a dict shaped like:
-      { "telegram": { "enabled": True, "bot_token": "...", "chat_id": "..." } }
     """
     import os as _os2
 
@@ -179,45 +176,81 @@ _DIVIDER = "\u2500" * 28   # ─────────────────
 
 def _fmt_breakout_row(r, arrow):
     """
-    Format one trendline signal for Telegram — 3 clean lines per stock:
+    Format one trendline signal for Telegram using full visual legend:
 
-      ▲ TICKER  (exchange flag)          ← ticker + direction
-         Company Name                    ← full name, indented
-         ₹Price  +X.XX%  RSI: XX  Vol: X.Xx ✓    ← key metrics
-         📐 #N  TL Type Name             ← trendline detail
+    Legend:
+      Bullish signal      \u25b2 (▲) per row  /  \U0001f7e2 (🟢) in header
+      Bearish signal      \u25bc (▼) per row  /  \U0001f534 (🔴) in header
+      Price % up          📈 bold +X.XX%
+      Price % down        📉 bold -X.XX%
+      RSI >= 70           🌡 bold RSI  (overbought)
+      RSI <= 30           🧊 bold RSI  (oversold)
+      Vol confirmed >=3x  🔥🔥 Vol ✅
+      Vol confirmed <3x   🔥 Vol ✅
+      Vol elevated >=1.5x ⚡ Vol X.Xx
     """
-    exchange = r.get("exchange", "")
-    price    = r.get("price", 0)
-    chg      = float(r.get("change", 0))
-    chg_s    = ("+{:.2f}%".format(chg)) if chg >= 0 else "{:.2f}%".format(chg)
-    rsi      = r.get("rsi", "")
-    rsi_s    = "  RSI: {}".format(rsi) if rsi != "" else ""
-    vol      = float(r.get("vol_ratio", 0))
-    vol_s    = "  Vol: <b>{:.1f}x</b> \u2714".format(vol) if r.get("vol_ok") else "  Vol: {:.1f}x".format(vol)
-    ccy      = _ccy(exchange)
+    exchange  = r.get("exchange", "")
+    price     = r.get("price", 0)
+    chg       = float(r.get("change", 0))
+    rsi       = r.get("rsi", "")
+    vol       = float(r.get("vol_ratio", 0))
+    vol_ok    = r.get("vol_ok", False)
+    ccy       = _ccy(exchange)
     exch_flag = "\U0001f1ee\U0001f1f3" if exchange == "NSE" else "\U0001f1fa\U0001f1f8"
 
-    # TL type: pull num + type name for the detail line
-    tl_num   = r.get("num", "")
-    tl_type  = r.get("type", r.get("tl_type", ""))
-    tl_line  = "\U0001f4d0 #{} {}".format(tl_num, tl_type) if tl_num else "\U0001f4d0 {}".format(tl_type)
+    # ── Price change with directional emoji ───────────────────────────────────
+    if chg >= 0:
+        chg_s = "\U0001f4c8 <b>+{:.2f}%</b>".format(chg)   # 📈
+    else:
+        chg_s = "\U0001f4c9 <b>{:.2f}%</b>".format(chg)    # 📉
+
+    # ── RSI badge ─────────────────────────────────────────────────────────────
+    if rsi != "":
+        rsi_val = float(rsi)
+        if rsi_val >= 70:
+            rsi_s = "  \U0001f321 <b>RSI:{}</b>".format(int(rsi_val))   # 🌡 overbought
+        elif rsi_val <= 30:
+            rsi_s = "  \U0001f9ca <b>RSI:{}</b>".format(int(rsi_val))   # 🧊 oversold
+        else:
+            rsi_s = "  RSI:{}".format(int(rsi_val))                       # plain
+    else:
+        rsi_s = ""
+
+    # ── Volume badge ──────────────────────────────────────────────────────────
+    if vol_ok and vol >= 3.0:
+        vol_s = "  \U0001f525\U0001f525 Vol \u2705"       # 🔥🔥 Vol ✅  (>=3x confirmed)
+    elif vol_ok:
+        vol_s = "  \U0001f525 Vol \u2705"                  # 🔥 Vol ✅   (confirmed <3x)
+    elif vol >= 1.5:
+        vol_s = "  \u26a1 Vol {:.1f}x".format(vol)         # ⚡ Vol X.Xx (elevated)
+    else:
+        vol_s = "  Vol {:.1f}x".format(vol)                  # plain
+
+    # ── Trendline type line ───────────────────────────────────────────────────
+    tl_num  = r.get("num", "")
+    tl_type = r.get("type", r.get("tl_type", ""))
+    tl_line = "\U0001f4d0 #{} {}".format(tl_num, tl_type) if tl_num else "\U0001f4d0 {}".format(tl_type)
 
     return (
         "{arrow} <b>{ticker}</b>  {flag}".format(
             arrow=arrow, ticker=r["ticker"], flag=exch_flag) + "\n"
         "   <i>{name}</i>".format(name=r["name"]) + "\n"
-        "   {ccy}{price}{chg}{rsi}{vol}".format(
-            ccy=ccy, price=price, chg="  " + chg_s, rsi=rsi_s, vol=vol_s) + "\n"
+        "   {ccy}{price}  {chg}{rsi}{vol}".format(
+            ccy=ccy, price=price, chg=chg_s, rsi=rsi_s, vol=vol_s) + "\n"
         "   {tl}".format(tl=tl_line)
     )
 
 def _fmt_spike_row(s):
     """
-    Format one volume spike for Telegram — 3 clean lines per stock:
+    Format one volume spike for Telegram using full visual legend:
 
-      ▲ TICKER   11.51x  ⚡ Breakout     ← direction + vol ratio + breakout tag
-         Company Name                    ← full name, indented
-         ₹Price  +X.XX%  📅 27 May       ← price, change, candle date
+    Legend:
+      Vol spike >= 5x    🔥🔥 bold X.XXx
+      Vol spike >= 2x    🔥 bold X.XXx
+      Vol spike < 2x     ⚡ X.XXx
+      Price % up         📈 bold +X.XX%
+      Price % down       📉 bold -X.XX%
+      Breakout tag       ⚡ Breakout (inline on first line)
     """
     ticker    = s.get("ticker", "")
     name      = s.get("name", "")
@@ -225,22 +258,34 @@ def _fmt_spike_row(s):
     price     = s.get("price", 0)
     vol_ratio = s.get("vol_ratio", 0)
     chg       = s.get("candle_chg", 0)
-    chg_s     = ("+{:.2f}%".format(chg)) if chg >= 0 else "{:.2f}%".format(chg)
     direction = "\u25b2" if s.get("direction") == "UP" else "\u25bc"
     ccy       = _ccy(exchange)
 
-    # Breakout tag — shown inline on first line if present
+    # ── Price change with directional emoji ───────────────────────────────────
+    if chg >= 0:
+        chg_s = "\U0001f4c8 <b>+{:.2f}%</b>".format(chg)   # 📈
+    else:
+        chg_s = "\U0001f4c9 <b>{:.2f}%</b>".format(chg)    # 📉
+
+    # ── Vol spike badge on first line ─────────────────────────────────────────
+    if vol_ratio >= 5.0:
+        vol_badge = "\U0001f525\U0001f525 <b>{:.2f}x</b>".format(vol_ratio)   # 🔥🔥 bold
+    elif vol_ratio >= 2.0:
+        vol_badge = "\U0001f525 <b>{:.2f}x</b>".format(vol_ratio)              # 🔥 bold
+    else:
+        vol_badge = "\u26a1 {:.2f}x".format(vol_ratio)                         # ⚡ plain
+
+    # ── Breakout tag — inline on first line if present ────────────────────────
     breakout_tag = "  \u26a1 <b>Breakout</b>" if s.get("has_breakout") else ""
 
-    # Shorten candle time: show only date part (drop the time + IST suffix)
-    raw_candle = s.get("candle_time", "")
-    # Format: "27 May 2026  14:30 IST"  →  "27 May 2026"
+    # ── Shorten candle time to date only ──────────────────────────────────────
+    raw_candle  = s.get("candle_time", "")
     candle_date = raw_candle.split("  ")[0].strip() if "  " in raw_candle else raw_candle
 
     return (
-        "{dir} <b>{ticker}</b>   <b>{ratio:.2f}x</b>{bk}".format(
+        "{dir} <b>{ticker}</b>   {vbadge}{bk}".format(
             dir=direction, ticker=ticker,
-            ratio=vol_ratio, bk=breakout_tag) + "\n"
+            vbadge=vol_badge, bk=breakout_tag) + "\n"
         "   <i>{name}</i>".format(name=name) + "\n"
         "   {ccy}{price}  {chg}  \U0001f4c5 {date}".format(
             ccy=ccy, price=price, chg=chg_s, date=candle_date)
@@ -289,10 +334,11 @@ def tg_send_breakout_alerts(results, tf_label, scan_time):
             buckets[key].append(r)
 
     labels = {
-        ("NSE",  "BULLISH"): ("\U0001f1ee\U0001f1f3 NSE \U0001f4c8 BULLISH Breakouts",  "\u25b2"),
-        ("NSE",  "BEARISH"): ("\U0001f1ee\U0001f1f3 NSE \U0001f4c9 BEARISH Breakouts",  "\u25bc"),
-        ("NYSE", "BULLISH"): ("\U0001f1fa\U0001f1f8 NYSE \U0001f4c8 BULLISH Breakouts", "\u25b2"),
-        ("NYSE", "BEARISH"): ("\U0001f1fa\U0001f1f8 NYSE \U0001f4c9 BEARISH Breakouts", "\u25bc"),
+        # 🟢 header for bullish, 🔴 header for bearish
+        ("NSE",  "BULLISH"): ("\U0001f7e2 \U0001f1ee\U0001f1f3 NSE \U0001f4c8 BULLISH Breakouts",  "\u25b2"),
+        ("NSE",  "BEARISH"): ("\U0001f534 \U0001f1ee\U0001f1f3 NSE \U0001f4c9 BEARISH Breakouts",  "\u25bc"),
+        ("NYSE", "BULLISH"): ("\U0001f7e2 \U0001f1fa\U0001f1f8 NYSE \U0001f4c8 BULLISH Breakouts", "\u25b2"),
+        ("NYSE", "BEARISH"): ("\U0001f534 \U0001f1fa\U0001f1f8 NYSE \U0001f4c9 BEARISH Breakouts", "\u25bc"),
     }
 
     for key, rows in buckets.items():
