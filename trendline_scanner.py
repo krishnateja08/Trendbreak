@@ -42,24 +42,323 @@ FIXES APPLIED (v2):
   FIX-11  Role reversal: proximity band widened 2%→3%
   FIX-12  Base range threshold: exchange-aware (0.20 NSE, 0.15 NYSE)
   FIX-13  Flag pole threshold: exchange-aware (7% NSE, 4% NYSE)
+
+FIXES APPLIED (v3):
+  FIX-14  Market-hours gate: skips live fetch when both NSE & NYSE are closed
+           NSE  → Mon–Fri 09:15–15:30 IST  (Asia/Kolkata)
+           NYSE → Mon–Fri 09:00–19:00 ET   (America/New_York, DST-aware)
+  FIX-15  Per-exchange skip: only fetches NSE stocks when NSE is open,
+           only fetches NYSE stocks when NYSE is open; uses synthetic
+           fallback for the closed exchange instead of live network calls
+  FIX-17  Timeframe data fix: each --timeframe now fetches the correct
+           yfinance interval+period (15m/60d, 1h/60d, 4h resampled from
+           1h/60d, 1d/6mo). Old config used '5d' for 15m (only ~100 bars)
+           and '3mo' for 4h resample (broken condition). Now explicit.
+  FIX-16  Output freshness check: skips full re-scan if existing report
+           is younger than one candle period (15m/1h/4h/1d) — use
+           --force flag to override
 ═══════════════════════════════════════════════════════════════
 """
 
 import os
+import sys
+import time
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo          # Python 3.9+ — no extra install needed
 import random
 import math
 
 import logging
 import warnings
+import json as _json_cfg
+import urllib.request
+import urllib.parse
 
 # Suppress all yfinance / urllib3 / requests noise
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
 logging.getLogger("urllib3").setLevel(logging.CRITICAL)
 logging.getLogger("requests").setLevel(logging.CRITICAL)
 warnings.filterwarnings("ignore")
+
+# ── Config loader ────────────────────────────────────────────────────────────
+def load_config():
+    """
+    Load Telegram config with the following priority order:
+      1. Environment variables  TELEGRAM_BOT_TOKEN  and  TELEGRAM_CHAT_ID
+         (set via GitHub Actions Secrets — preferred for CI)
+      2. config.json in the same directory as this script
+         (used for local runs)
+
+    Returns a dict shaped like:
+      { "telegram": { "enabled": True, "bot_token": "...", "chat_id": "..." } }
+    """
+    import os as _os2
+
+    # ── Priority 1: GitHub Secrets / environment variables ────────────────────
+    env_token = _os2.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    env_chat  = _os2.environ.get("TELEGRAM_CHAT_ID",  "").strip()
+
+    if env_token and env_chat:
+        print("  ✅  Telegram credentials loaded from environment variables.")
+        return {
+            "telegram": {
+                "enabled":   True,
+                "bot_token": env_token,
+                "chat_id":   env_chat,
+            }
+        }
+
+    # ── Priority 2: config.json (local development) ───────────────────────────
+    cfg_path = _os2.path.join(_os2.path.dirname(_os2.path.abspath(__file__)), "config.json")
+    if not _os2.path.exists(cfg_path):
+        print(f"  ⚠️  config.json not found and no env vars set — Telegram alerts disabled.")
+        return {}
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = _json_cfg.load(f)
+        print("  ✅  Telegram credentials loaded from config.json.")
+        return cfg
+    except Exception as e:
+        print(f"  ⚠️  Could not read config.json: {e} — Telegram alerts disabled.")
+        return {}
+
+CONFIG = load_config()
+
+# ── Telegram Alert Module ────────────────────────────────────────────────────
+def _tg_cfg():
+    """Return telegram config dict or None if disabled/missing."""
+    tg = CONFIG.get("telegram", {})
+    if not tg.get("enabled", False):
+        return None
+    token = tg.get("bot_token", "")
+    chat  = tg.get("chat_id", "")
+    if not token or token == "YOUR_BOT_TOKEN_HERE":
+        return None
+    if not chat or str(chat) == "YOUR_CHAT_ID_HERE":
+        return None
+    return tg
+
+def tg_send(text):
+    """Send a plain-text message to Telegram. Silently returns False on failure."""
+    tg = _tg_cfg()
+    if not tg:
+        return False
+    try:
+        url  = f"https://api.telegram.org/bot{tg['bot_token']}/sendMessage"
+        data = urllib.parse.urlencode({
+            "chat_id":    str(tg["chat_id"]),
+            "text":       text,
+            "parse_mode": "HTML",
+        }).encode()
+        req = urllib.request.Request(url, data=data, method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status == 200
+    except Exception as e:
+        print(f"  ⚠️  Telegram send failed: {e}")
+        return False
+
+def _tg_send_block(lines, split_size=4000):
+    """Join lines into message and send, splitting if over Telegram limit."""
+    msg = "\n".join(lines)
+    if not msg.strip():
+        return
+    if len(msg) <= 4096:
+        tg_send(msg)
+    else:
+        for i in range(0, len(msg), split_size):
+            tg_send(msg[i:i+split_size])
+
+# ── Currency symbol helper ────────────────────────────────────────────────────
+def _ccy(exchange):
+    return "\u20b9" if exchange == "NSE" else "$"   # ₹ or $
+
+# ── Divider line used between header and stock rows ───────────────────────────
+_DIVIDER = "\u2500" * 28   # ────────────────────────────────
+
+def _fmt_breakout_row(r, arrow):
+    """
+    Format one trendline signal for Telegram — 3 clean lines per stock:
+
+      ▲ TICKER  (exchange flag)          ← ticker + direction
+         Company Name                    ← full name, indented
+         ₹Price  +X.XX%  RSI: XX  Vol: X.Xx ✓    ← key metrics
+         📐 #N  TL Type Name             ← trendline detail
+    """
+    exchange = r.get("exchange", "")
+    price    = r.get("price", 0)
+    chg      = float(r.get("change", 0))
+    chg_s    = ("+{:.2f}%".format(chg)) if chg >= 0 else "{:.2f}%".format(chg)
+    rsi      = r.get("rsi", "")
+    rsi_s    = "  RSI: {}".format(rsi) if rsi != "" else ""
+    vol      = float(r.get("vol_ratio", 0))
+    vol_s    = "  Vol: <b>{:.1f}x</b> \u2714".format(vol) if r.get("vol_ok") else "  Vol: {:.1f}x".format(vol)
+    ccy      = _ccy(exchange)
+    exch_flag = "\U0001f1ee\U0001f1f3" if exchange == "NSE" else "\U0001f1fa\U0001f1f8"
+
+    # TL type: pull num + type name for the detail line
+    tl_num   = r.get("num", "")
+    tl_type  = r.get("type", r.get("tl_type", ""))
+    tl_line  = "\U0001f4d0 #{} {}".format(tl_num, tl_type) if tl_num else "\U0001f4d0 {}".format(tl_type)
+
+    return (
+        "{arrow} <b>{ticker}</b>  {flag}".format(
+            arrow=arrow, ticker=r["ticker"], flag=exch_flag) + "\n"
+        "   <i>{name}</i>".format(name=r["name"]) + "\n"
+        "   {ccy}{price}{chg}{rsi}{vol}".format(
+            ccy=ccy, price=price, chg="  " + chg_s, rsi=rsi_s, vol=vol_s) + "\n"
+        "   {tl}".format(tl=tl_line)
+    )
+
+def _fmt_spike_row(s):
+    """
+    Format one volume spike for Telegram — 3 clean lines per stock:
+
+      ▲ TICKER   11.51x  ⚡ Breakout     ← direction + vol ratio + breakout tag
+         Company Name                    ← full name, indented
+         ₹Price  +X.XX%  📅 27 May       ← price, change, candle date
+    """
+    ticker    = s.get("ticker", "")
+    name      = s.get("name", "")
+    exchange  = s.get("exchange", "")
+    price     = s.get("price", 0)
+    vol_ratio = s.get("vol_ratio", 0)
+    chg       = s.get("candle_chg", 0)
+    chg_s     = ("+{:.2f}%".format(chg)) if chg >= 0 else "{:.2f}%".format(chg)
+    direction = "\u25b2" if s.get("direction") == "UP" else "\u25bc"
+    ccy       = _ccy(exchange)
+
+    # Breakout tag — shown inline on first line if present
+    breakout_tag = "  \u26a1 <b>Breakout</b>" if s.get("has_breakout") else ""
+
+    # Shorten candle time: show only date part (drop the time + IST suffix)
+    raw_candle = s.get("candle_time", "")
+    # Format: "27 May 2026  14:30 IST"  →  "27 May 2026"
+    candle_date = raw_candle.split("  ")[0].strip() if "  " in raw_candle else raw_candle
+
+    return (
+        "{dir} <b>{ticker}</b>   <b>{ratio:.2f}x</b>{bk}".format(
+            dir=direction, ticker=ticker,
+            ratio=vol_ratio, bk=breakout_tag) + "\n"
+        "   <i>{name}</i>".format(name=name) + "\n"
+        "   {ccy}{price}  {chg}  \U0001f4c5 {date}".format(
+            ccy=ccy, price=price, chg=chg_s, date=candle_date)
+    )
+
+def tg_send_breakout_alerts(results, tf_label, scan_time):
+    """
+    Send 4 separate Telegram messages (one per exchange × direction bucket):
+      1. NSE  Bullish breakouts
+      2. NSE  Bearish breakouts
+      3. NYSE Bullish breakouts
+      4. NYSE Bearish breakouts
+
+    Each message layout:
+      ┌─────────────────────────────────┐
+      │  🇮🇳 NSE 📈 BULLISH Breakouts   │  ← bold title
+      │  🕐 28 May 2026  20:40:12        │  ← scan time
+      │  ⏱ 1 Day  |  📊 6 signals       │  ← timeframe + count
+      │  ────────────────────────────   │  ← divider
+      │  ▲ TICKER  🇮🇳                   │
+      │     Company Name                │
+      │     ₹Price  +X.XX%  RSI  Vol    │
+      │     📐 #N  TL Type              │
+      │  ▲ ...                          │
+      └─────────────────────────────────┘
+    """
+    tg = _tg_cfg()
+    if not tg:
+        return
+    alerts_cfg = tg.get("alerts", {})
+    if not alerts_cfg.get("trendline_breakouts", True):
+        return
+
+    vol_ok_only = alerts_cfg.get("only_confirmed_volume", False)
+    filtered = [r for r in results if not (vol_ok_only and not r.get("vol_ok", False))]
+
+    buckets = {
+        ("NSE",  "BULLISH"): [],
+        ("NSE",  "BEARISH"): [],
+        ("NYSE", "BULLISH"): [],
+        ("NYSE", "BEARISH"): [],
+    }
+    for r in filtered:
+        key = (r.get("exchange", ""), r.get("signal", ""))
+        if key in buckets:
+            buckets[key].append(r)
+
+    labels = {
+        ("NSE",  "BULLISH"): ("\U0001f1ee\U0001f1f3 NSE \U0001f4c8 BULLISH Breakouts",  "\u25b2"),
+        ("NSE",  "BEARISH"): ("\U0001f1ee\U0001f1f3 NSE \U0001f4c9 BEARISH Breakouts",  "\u25bc"),
+        ("NYSE", "BULLISH"): ("\U0001f1fa\U0001f1f8 NYSE \U0001f4c8 BULLISH Breakouts", "\u25b2"),
+        ("NYSE", "BEARISH"): ("\U0001f1fa\U0001f1f8 NYSE \U0001f4c9 BEARISH Breakouts", "\u25bc"),
+    }
+
+    for key, rows in buckets.items():
+        if not rows:
+            continue
+        title, arrow = labels[key]
+        n = len(rows)
+        lines = [
+            "<b>" + title + "</b>",
+            "\U0001f550 " + scan_time,
+            "\u23f1 " + tf_label + "  |  \U0001f4ca " + str(n) + " signal" + ("s" if n != 1 else ""),
+            _DIVIDER,
+        ]
+        for r in rows[:20]:
+            lines.append(_fmt_breakout_row(r, arrow))
+            lines.append("")          # blank line between stocks for breathing room
+        if n > 20:
+            lines.append("\u2026 and {} more".format(n - 20))
+        _tg_send_block(lines)
+
+def tg_send_volume_spike_alerts(vol_spikes, tf_label, scan_time):
+    """
+    Send 2 separate Telegram messages (one per exchange):
+      1. NSE  Volume Spikes
+      2. NYSE Volume Spikes
+
+    Each message layout:
+      ┌─────────────────────────────────┐
+      │  🇮🇳 NSE ⚡ Volume Spikes        │  ← bold title
+      │  🕐 28 May 2026  20:40:12        │  ← scan time
+      │  ⏱ 1 Day  |  🔍 15 stocks ≥ 1.5x│  ← timeframe + count
+      │  ────────────────────────────   │  ← divider
+      │  ▲ TICKER   11.51x  ⚡ Breakout  │
+      │     Company Name                │
+      │     ₹Price  +X.XX%  📅 27 May   │
+      │  ▼ ...                          │
+      └─────────────────────────────────┘
+    """
+    tg = _tg_cfg()
+    if not tg:
+        return
+    alerts_cfg = tg.get("alerts", {})
+    if not alerts_cfg.get("volume_spikes", True):
+        return
+
+    min_ratio = float(alerts_cfg.get("min_vol_ratio", 1.5))
+
+    for exch, flag in [("NSE", "\U0001f1ee\U0001f1f3"), ("NYSE", "\U0001f1fa\U0001f1f8")]:
+        rows = [s for s in vol_spikes
+                if s.get("exchange") == exch and s.get("vol_ratio", 0) >= min_ratio]
+        if not rows:
+            continue
+        n = len(rows)
+        lines = [
+            "<b>" + flag + " " + exch + " \u26a1 Volume Spikes</b>",
+            "\U0001f550 " + scan_time,
+            "\u23f1 " + tf_label + "  |  \U0001f50d " + str(n) + " stock" + ("s" if n != 1 else "")
+                + " \u2265 " + "{:.1f}".format(min_ratio) + "x",
+            _DIVIDER,
+        ]
+        for s in rows[:20]:
+            lines.append(_fmt_spike_row(s))
+            lines.append("")          # blank line between stocks
+        if n > 20:
+            lines.append("\u2026 and {} more".format(n - 20))
+        _tg_send_block(lines)
 
 try:
     import yfinance as yf
@@ -377,31 +676,65 @@ DIRS = [
     "down","up","up","down","up","up","up","down","down","up",
 ]
 
+# ── Timeframe Configuration ───────────────────────────────────────────────────
+# Maps CLI timeframe arg → (yfinance interval, yfinance period, min_bars, label)
+#
+# yfinance intraday history hard limits:
+#   15m  → max 60 days  →  use "60d"  (~390 bars on trading days)
+#   1h   → max 730 days →  use "60d"  (~390 bars, more than enough)
+#   4h   → no native 4h; fetch as 1h then resample → use "60d"
+#   1d   → no limit     →  use "6mo"  (~126 daily bars)
+#
+TIMEFRAME_CONFIG = {
+    "15m": ("15m", "60d",  60,  "15 Min"),
+    "1h":  ("1h",  "60d",  40,  "1 Hour"),
+    "4h":  ("1h",  "60d",  30,  "4 Hour"),   # fetched as 1h, resampled to 4h
+    "1d":  ("1d",  "6mo",  30,  "1 Day"),
+}
+# Active timeframe — overridden by --timeframe CLI arg or env var SCAN_TIMEFRAME
+ACTIVE_TIMEFRAME = "1d"
+
 # ── Live Data via yfinance (with synthetic fallback) ─────────────────────────
 _yf_cache = {}
 
-def fetch_yf(yf_ticker, period="6mo"):
-    """Fetch OHLCV from yfinance with caching. Returns DataFrame or None."""
-    if yf_ticker in _yf_cache:
-        return _yf_cache[yf_ticker]
+def fetch_yf(yf_ticker, period="6mo", interval="1d", resample_4h=False):
+    """
+    Fetch OHLCV from yfinance with caching. Returns DataFrame or None.
+    resample_4h=True: fetch 1h bars then resample to 4h (used for 4h timeframe).
+    """
+    cache_key = f"{yf_ticker}|{interval}|{period}|4h={resample_4h}"
+    if cache_key in _yf_cache:
+        return _yf_cache[cache_key]
     try:
         import io, sys
         _stderr = sys.stderr
         sys.stderr = io.StringIO()
         try:
-            df = yf.Ticker(yf_ticker).history(period=period, auto_adjust=True)
+            df = yf.Ticker(yf_ticker).history(period=period, interval=interval, auto_adjust=True)
         finally:
             sys.stderr = _stderr
-        if df is None or len(df) < 30:
-            _yf_cache[yf_ticker] = None
+        if df is None or len(df) < 10:
+            _yf_cache[cache_key] = None
             return None
         df = df[["Open","High","Low","Close","Volume"]].copy()
         idx = pd.to_datetime(df.index)
+        # Preserve tz-aware timestamps as IST before stripping (used for candle_time display)
+        df["_ts"] = idx.tz_convert("Asia/Kolkata") if idx.tz is not None else idx
         df.index = idx.tz_convert(None) if idx.tz is not None else idx
-        _yf_cache[yf_ticker] = df
+        # Resample 1h → 4h bars when requested (4h timeframe)
+        if resample_4h and interval == "1h":
+            ts_col = df["_ts"].copy() if "_ts" in df.columns else None
+            df = (df.resample("4h")
+                    .agg({"Open":"first","High":"max","Low":"min",
+                          "Close":"last","Volume":"sum"})
+                    .dropna())
+            # Re-attach _ts (first IST timestamp of each 4h bar)
+            if ts_col is not None:
+                df["_ts"] = ts_col.resample("4h").first().reindex(df.index)
+        _yf_cache[cache_key] = df
         return df
     except Exception:
-        _yf_cache[yf_ticker] = None
+        _yf_cache[cache_key] = None
         return None
 
 def generate_ohlcv(base_price, pattern="random", days=130):
@@ -464,21 +797,28 @@ def inject_breakout(df, direction="up"):
             df.iloc[i, df.columns.get_loc("Volume")] = orig_vol   * 2.5
     return df
 
-def fetch_data(ticker, base_price, idx, exchange="NSE"):
+def fetch_data(ticker, base_price, idx, exchange="NSE", live=True):
     """
-    Fetch real OHLCV via yfinance.
-    NSE tickers get .NS suffix. Falls back to synthetic data if yfinance
-    is unavailable or returns insufficient data.
+    Fetch real OHLCV via yfinance using ACTIVE_TIMEFRAME.
+    - 15m  → fetches 15m bars  for last 60 days
+    - 1h   → fetches 1h  bars  for last 60 days
+    - 4h   → fetches 1h  bars  for last 60 days, then resamples to 4h
+    - 1d   → fetches 1d  bars  for last 6 months
+    NSE tickers get .NS suffix (.BO tried as fallback).
+    live=False skips all network calls and uses synthetic data.
     """
-    if YF_AVAILABLE:
+    tf_interval, tf_period, tf_min_bars, _ = TIMEFRAME_CONFIG.get(ACTIVE_TIMEFRAME, TIMEFRAME_CONFIG["1d"])
+    is_4h = (ACTIVE_TIMEFRAME == "4h")
+
+    if YF_AVAILABLE and live:
         yf_ticker = (ticker + ".NS") if exchange == "NSE" else ticker
-        df = fetch_yf(yf_ticker)
-        if df is not None and len(df) >= 30:
+        df = fetch_yf(yf_ticker, period=tf_period, interval=tf_interval, resample_4h=is_4h)
+        if df is not None and len(df) >= tf_min_bars:
             return df
         # If .NS failed, try .BO (BSE) for NSE stocks
         if exchange == "NSE":
-            df = fetch_yf(ticker + ".BO")
-            if df is not None and len(df) >= 30:
+            df = fetch_yf(ticker + ".BO", period=tf_period, interval=tf_interval, resample_4h=is_4h)
+            if df is not None and len(df) >= tf_min_bars:
                 return df
     # Synthetic fallback
     df = generate_ohlcv(base_price, pattern=PATTERNS[idx % len(PATTERNS)])
@@ -984,13 +1324,16 @@ def calc_rsi(df, period=14):
     return round(val, 1) if not np.isnan(val) else None
 
 def rsi_zone(rsi):
-    """Return zone label and CSS class for RSI value."""
-    if rsi is None:   return "—",       "rz-na"
-    if rsi >= 70:     return "OB",      "rz-ob"
-    if rsi <= 30:     return "OS",      "rz-os"
-    if rsi >= 60:     return "Strong",  "rz-str"
-    if rsi <= 40:     return "Weak",    "rz-wk"
-    return "Neutral", "rz-neu"
+    """Return zone label and CSS class for RSI value.
+    >70 = red (HOT/overbought), 55-70 = green (Bull), 45-55 = grey (Mid),
+    30-45 = orange (Fade), <30 = blue (OS/oversold)
+    """
+    if rsi is None:    return "—",     "rz-na"
+    if rsi > 70:       return "HOT",   "rz-hot"
+    if rsi >= 55:      return "Bull",  "rz-bull"
+    if rsi >= 45:      return "Mid",   "rz-mid"
+    if rsi >= 30:      return "Fade",  "rz-fade"
+    return "OS",   "rz-os"
 
 # ── Sector RSI ───────────────────────────────────────────────────────────────
 SECTOR_BASE_PRICES = {
@@ -1010,7 +1353,9 @@ def get_sector_rsi(sector_code):
     if sector_code in _sector_rsi_cache:
         return _sector_rsi_cache[sector_code]
     if YF_AVAILABLE:
-        df_s = fetch_yf(sector_code, period="3mo")
+        # Use matching period/interval for sector RSI
+        tf_interval, tf_period, _, _ = TIMEFRAME_CONFIG.get(ACTIVE_TIMEFRAME, TIMEFRAME_CONFIG["1d"])
+        df_s = fetch_yf(sector_code, period=tf_period, interval=tf_interval)
         if df_s is not None and len(df_s) >= 15:
             rsi_val = calc_rsi(df_s)
             _sector_rsi_cache[sector_code] = rsi_val
@@ -1080,8 +1425,8 @@ def deduplicate_signals(results):
     return _pick(bull, MAX_PER_DIRECTION) + _pick(bear, MAX_PER_DIRECTION)
 
 
-def scan_stock(ticker, name, base_price, idx, exchange):
-    df = fetch_data(ticker, base_price, idx, exchange=exchange)
+def scan_stock(ticker, name, base_price, idx, exchange, live=True):
+    df = fetch_data(ticker, base_price, idx, exchange=exchange, live=live)
     cur  = float(df["Close"].iloc[-1])
     prev = float(df["Close"].iloc[-2])
     pct  = round((cur - prev) / prev * 100, 2)
@@ -1142,204 +1487,305 @@ def scan_stock(ticker, name, base_price, idx, exchange):
     return results
 
 
+
+
 # ── HTML Builder ──────────────────────────────────────────────────────────────
 _HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>TrendBreak Pro &middot; NSE &amp; NYSE</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
 <style>
 :root{
-  --nb:#0a1628;--nb2:#0d1f3c;--nb3:#132550;
-  --acc:#2e8fe4;--acc2:#60b8ff;--acc3:#a8dfff;
-  --bdr:rgba(56,163,245,0.25);--bdr2:rgba(56,163,245,0.45);
-  --txt:#e8f2ff;--mu:#8dafc8;--wh:#ffffff;
-  --bu:#34d97b;--be:#f87171;--mx:#fbbf24;
-  --nse:#fbbf24;--nyse:#60b8ff;
-  --mono:'Courier New',Courier,monospace
+  --bg:#0d0f14;--surf:#13161d;--surf2:#1a1e27;
+  --bdr:rgba(255,255,255,0.07);--bdr2:rgba(255,255,255,0.13);
+  --txt:#e8eaf0;--mu:#8b909e;--dim:#555b6a;
+  --bull:#00d17a;--bull-bg:rgba(0,209,122,0.09);--bull-br:rgba(0,209,122,0.28);
+  --bear:#ff4c5b;--bear-bg:rgba(255,76,91,0.09);--bear-br:rgba(255,76,91,0.28);
+  --acc:#4c9fff;--acc-bg:rgba(76,159,255,0.09);
+  --gold:#f5c842;
+  --mono:'IBM Plex Mono',monospace;
+  --sans:'IBM Plex Sans',sans-serif
 }
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--nb);color:var(--txt);font-family:system-ui,sans-serif;font-size:13px;min-height:100vh}
+body{background:var(--bg);color:var(--txt);font-family:var(--sans);font-size:13px;min-height:100vh}
 
-/* ── TOPBAR ── */
-.topbar{background:var(--nb2);border-bottom:1px solid var(--bdr2);padding:7px 16px;
-  display:flex;align-items:center;gap:10px;flex-wrap:wrap;position:sticky;top:0;z-index:100}
-.logo{display:flex;align-items:center;gap:8px}
-.logo-icon{width:26px;height:26px;background:var(--acc);border-radius:5px;
-  display:flex;align-items:center;justify-content:center}
-.logo-icon svg{width:14px;height:14px;fill:none;stroke:#fff;stroke-width:2.2;stroke-linecap:round;stroke-linejoin:round}
-.logo-name{font-weight:700;font-size:14px;color:#fff;letter-spacing:-.2px}
-.logo-sub{font-size:10px;color:var(--acc3);font-family:var(--mono)}
-.vsep{width:1px;height:24px;background:var(--bdr2);flex-shrink:0}
-.tbadge{font-size:10px;font-family:var(--mono);background:rgba(46,143,228,0.1);
-  border:1px solid var(--bdr);color:var(--acc2);border-radius:4px;padding:2px 7px;white-space:nowrap}
-.pulse{display:inline-block;width:5px;height:5px;background:var(--bu);border-radius:50%;
-  margin-right:3px;vertical-align:middle;animation:pulse 1.8s ease-in-out infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
-.topbadges{display:flex;gap:5px;flex-wrap:wrap;margin-left:auto}
+/* ── TOP BAR ── */
+.topbar{background:var(--surf);border-bottom:1px solid var(--bdr2);padding:9px 20px;
+  display:flex;align-items:center;gap:12px;flex-wrap:wrap;position:sticky;top:0;z-index:100}
+.brand{display:flex;align-items:center;gap:9px}
+.brand-icon{width:28px;height:28px;background:var(--acc);border-radius:6px;
+  display:flex;align-items:center;justify-content:center;flex-shrink:0}
+.brand-icon svg{width:14px;height:14px;fill:none;stroke:#fff;stroke-width:2.2;
+  stroke-linecap:round;stroke-linejoin:round}
+.brand-name{font-family:var(--mono);font-size:15px;font-weight:600;color:#fff}
+.brand-sub{font-size:10px;color:var(--dim);font-family:var(--mono)}
+.vsep{width:1px;height:22px;background:var(--bdr2);flex-shrink:0}
+.tbadge{font-size:10px;font-family:var(--mono);background:var(--acc-bg);
+  border:1px solid var(--bdr2);color:var(--acc);border-radius:4px;padding:2px 8px;white-space:nowrap}
+.pulse{display:inline-block;width:5px;height:5px;background:var(--bull);border-radius:50%;
+  margin-right:4px;vertical-align:middle;animation:pulse 1.8s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+.clock-wrap{display:flex;gap:10px;align-items:center;font-family:var(--mono);margin-left:auto}
+.clock-item{display:flex;flex-direction:column;align-items:center}
+.clock-time{font-size:11px;font-weight:600;color:var(--acc);letter-spacing:.5px}
+.clock-lbl{font-size:9px;color:var(--dim);text-transform:uppercase;letter-spacing:.6px}
+.clock-sep{color:var(--bdr2)}
 
 /* ── STATS STRIP ── */
-.stats{display:flex;background:rgba(0,0,0,0.3);border-bottom:1px solid var(--bdr);overflow-x:auto}
-.sc{flex:1;min-width:72px;padding:7px 10px;text-align:center;border-right:1px solid var(--bdr)}
+.stats{display:flex;background:rgba(0,0,0,0.25);border-bottom:1px solid var(--bdr);overflow-x:auto}
+.sc{flex:1;min-width:72px;padding:8px 10px;text-align:center;border-right:1px solid var(--bdr)}
 .sc:last-child{border-right:none}
-.sn{font-size:20px;font-weight:700;font-family:var(--mono);line-height:1.1}
-.sl{font-size:9px;color:var(--acc3);text-transform:uppercase;letter-spacing:.5px;margin-top:1px}
+.sn{font-size:19px;font-weight:700;font-family:var(--mono);line-height:1.1}
+.sl{font-size:9px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;margin-top:1px}
 
-/* ── FILTER BAR ── */
-.filterbar{display:flex;align-items:center;gap:6px;padding:8px 14px;
-  background:rgba(0,0,0,0.18);border-bottom:1px solid var(--bdr);flex-wrap:wrap}
-.fb-sep{width:1px;height:20px;background:var(--bdr2);flex-shrink:0;margin:0 2px}
-.btn{padding:4px 13px;border-radius:18px;font-size:11px;font-weight:700;
-  border:1px solid var(--bdr);color:var(--mu);background:transparent;
-  cursor:pointer;font-family:var(--mono);transition:all .15s}
-.btn:hover{border-color:var(--acc2);color:var(--acc2)}
-.btn.on{background:rgba(46,143,228,0.15);color:var(--acc2);border-color:var(--bdr2)}
-.btn.bull-on{background:rgba(52,217,123,0.12);color:var(--bu);border-color:rgba(52,217,123,0.4)}
-.btn.bear-on{background:rgba(248,113,113,0.12);color:var(--be);border-color:rgba(248,113,113,0.4)}
-.tb-sect{background:#0d1f3c;color:var(--mu);border:1px solid var(--bdr);border-radius:4px;
-  padding:3px 8px;font-size:11px;font-family:var(--mono);cursor:pointer;outline:none}
-.tb-sect:focus{border-color:var(--acc2)}
-.result-count{font-size:10px;color:var(--mu);font-family:var(--mono);margin-left:auto}
+/* ── TOOLBAR ── */
+.toolbar{display:flex;align-items:center;gap:8px;padding:10px 20px;
+  border-bottom:1px solid var(--bdr);flex-wrap:wrap;background:var(--surf)}
+.search-wrap{position:relative;flex:1;min-width:160px;max-width:260px}
+.search-wrap svg{position:absolute;left:9px;top:50%;transform:translateY(-50%);
+  width:13px;height:13px;stroke:var(--dim);fill:none;stroke-width:2;stroke-linecap:round}
+.search{width:100%;background:var(--bg);border:1px solid var(--bdr2);border-radius:6px;
+  padding:6px 10px 6px 30px;color:var(--txt);font-size:11px;font-family:var(--mono);outline:none}
+.search:focus{border-color:var(--acc)}
+.search::placeholder{color:var(--dim)}
+.btn-grp{display:flex;gap:0;background:var(--bg);border:1px solid var(--bdr2);
+  border-radius:6px;overflow:hidden}
+.bg-btn{padding:5px 13px;font-size:11px;font-weight:600;font-family:var(--mono);
+  cursor:pointer;border:none;background:transparent;color:var(--dim);transition:.12s}
+.bg-btn:hover{color:var(--txt);background:var(--surf2)}
+.bg-btn.active{color:var(--txt);background:var(--surf2)}
+.bg-btn.bull-on{color:var(--bull);background:var(--bull-bg)}
+.bg-btn.bear-on{color:var(--bear);background:var(--bear-bg)}
+.bg-btn+.bg-btn{border-left:1px solid var(--bdr)}
+/* NSE button active — Indian saffron */
+.bg-btn.nse-btn.active{color:#ff9933;background:rgba(255,153,51,0.12);border-color:rgba(255,153,51,0.3)}
+/* NYSE button active — American blue */
+.bg-btn.nyse-btn.active{color:#5b8fff;background:rgba(60,100,200,0.12);border-color:rgba(60,100,200,0.3)}
+select.flt{background:var(--bg);border:1px solid var(--bdr2);border-radius:6px;
+  padding:5px 10px;color:var(--mu);font-size:11px;font-family:var(--mono);outline:none;cursor:pointer}
+select.flt:focus{border-color:var(--acc)}
+.vol-lbl{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--dim);
+  font-family:var(--mono);cursor:pointer}
+.vol-lbl input{accent-color:var(--acc);cursor:pointer}
+.rc{margin-left:auto;font-size:10px;color:var(--dim);font-family:var(--mono)}
+
+/* ── LEGEND TOGGLE ── */
+.lgnd-toggle{font-size:10px;color:var(--acc);font-family:var(--mono);cursor:pointer;
+  padding:4px 10px;border:1px solid var(--bdr2);border-radius:6px;white-space:nowrap;
+  background:transparent;transition:.12s}
+.lgnd-toggle:hover{border-color:var(--acc)}
+
+/* ── LEGEND PANEL ── */
+.lgnd-panel{display:none;padding:10px 20px;border-bottom:1px solid var(--bdr);
+  background:var(--surf);grid-template-columns:repeat(auto-fill,minmax(195px,1fr));gap:4px 14px}
+.lgnd-panel.open{display:grid}
+.lgnd-item{font-size:10px;font-family:var(--mono);color:var(--dim)}
+.lgnd-item b{color:var(--mu);margin-right:4px}
+
+/* ── TABLE ── */
+.tbl-wrap{overflow-x:auto;padding:0 20px 32px}
+table{width:100%;border-collapse:collapse;font-size:12px;min-width:1000px}
+thead th{text-align:left;padding:9px 11px;color:var(--dim);font-family:var(--mono);
+  font-size:10px;font-weight:500;letter-spacing:.07em;text-transform:uppercase;
+  border-bottom:1px solid var(--bdr2);white-space:nowrap;cursor:pointer;user-select:none;
+  transition:color .12s}
+thead th:hover{color:var(--mu)}
+thead th.sorted{color:var(--acc)}
+thead th .sa{margin-left:3px;opacity:.35;font-size:9px}
+thead th.sorted .sa{opacity:1}
+tbody tr{border-bottom:1px solid var(--bdr);transition:background .1s;cursor:default}
+tbody tr:hover{background:var(--surf)}
+tbody td{padding:8px 11px;vertical-align:middle}
+
+/* cell styles */
+.ct{font-family:var(--mono);font-weight:600;font-size:12px;color:#fff;white-space:nowrap}
+.cn{color:var(--mu);max-width:155px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+/* Sector badge — default grey */
+.cs span{font-size:10px;padding:2px 7px;border-radius:3px;background:var(--surf2);
+  border:1px solid var(--bdr2);color:var(--dim);font-family:var(--mono);white-space:nowrap;font-weight:600}
+/* Sector badge — RSI zone colours matching the panel cards */
+.cs span.sz-hot {background:rgba(255,76,91,0.12);  border-color:rgba(255,76,91,0.40);  color:#ff4c5b}
+.cs span.sz-bull{background:rgba(0,209,122,0.10);  border-color:rgba(0,209,122,0.35);  color:#00d17a}
+.cs span.sz-mid {background:var(--surf2);           border-color:var(--bdr2);           color:var(--mu)}
+.cs span.sz-fade{background:rgba(255,140,66,0.10);  border-color:rgba(255,140,66,0.38); color:#ff8c42}
+.cs span.sz-os  {background:rgba(76,159,255,0.10);  border-color:rgba(76,159,255,0.38); color:#4c9fff}
+.cp{font-family:var(--mono);font-weight:500;text-align:right;white-space:nowrap}
+.cc{font-family:var(--mono);font-weight:600;text-align:right;white-space:nowrap}
+.cc.up{color:var(--bull)}.cc.dn{color:var(--bear)}
+.sig-badge{display:inline-flex;align-items:center;gap:3px;font-size:10px;font-weight:700;
+  font-family:var(--mono);padding:3px 8px;border-radius:4px;white-space:nowrap}
+.sig-badge.bull{background:var(--bull-bg);color:var(--bull);border:1px solid var(--bull-br)}
+.sig-badge.bear{background:var(--bear-bg);color:var(--bear);border:1px solid var(--bear-br)}
+.crsi{font-family:var(--mono);text-align:right;white-space:nowrap}
+.rv{font-size:12px;font-weight:600}
+.rz{font-size:9px;margin-left:3px}
+/* RSI zone colours: >70 red | 55-70 green | 45-55 grey | 30-45 orange | <30 blue */
+.rz-hot {color:#ff4c5b}
+.rz-bull{color:#00d17a}
+.rz-mid {color:#8b909e}
+.rz-fade{color:#ff8c42}
+.rz-os  {color:#4c9fff}
+.rz-na  {color:var(--dim)}
+.cvol{font-family:var(--mono);text-align:right;white-space:nowrap}
+.vok{color:var(--bull)}
+.ctln{white-space:nowrap}
+.tnum{display:inline-block;font-family:var(--mono);font-size:9px;font-weight:700;
+  background:var(--surf2);border:1px solid var(--bdr2);color:var(--dim);
+  border-radius:3px;padding:1px 5px;margin-right:5px}
+.tname{color:var(--mu);font-size:11px}
+.cdet{max-width:270px}
+.dtxt{color:var(--dim);font-size:10px;white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis;max-width:270px;display:block}
+.dtxt:hover{white-space:normal;overflow:visible;color:var(--mu)}
+.clvl{font-family:var(--mono);font-size:11px;color:var(--dim);text-align:right}
+
+/* ── EXCHANGE BADGES — flag colours ── */
+.exch-badge{display:inline-flex;align-items:center;gap:4px;font-size:10px;font-weight:700;
+  font-family:var(--mono);padding:2px 8px;border-radius:4px;white-space:nowrap;letter-spacing:.04em}
+/* NSE — Indian tricolour: saffron border/text, green underline accent */
+.exch-nse{
+  background:linear-gradient(135deg,rgba(255,153,51,0.13) 0%,rgba(19,100,52,0.10) 100%);
+  border:1px solid rgba(255,153,51,0.55);
+  color:#ff9933;
+  box-shadow:0 1px 0 0 rgba(19,100,52,0.55)}
+/* NYSE — American flag: red/blue */
+.exch-nyse{
+  background:linear-gradient(135deg,rgba(60,100,200,0.13) 0%,rgba(187,31,47,0.10) 100%);
+  border:1px solid rgba(60,100,200,0.55);
+  color:#5b8fff;
+  box-shadow:0 1px 0 0 rgba(187,31,47,0.55)}
 
 /* ── SECTOR RSI PANEL ── */
-.srp{background:rgba(0,0,0,0.2);border-bottom:1px solid var(--bdr);padding:8px 14px}
-.srp-title{font-size:9px;color:var(--acc3);text-transform:uppercase;letter-spacing:.5px;
-  margin-bottom:6px;font-family:var(--mono)}
-.srp-tiles{display:flex;flex-wrap:wrap;gap:6px}
-.srp-tile{display:flex;align-items:center;gap:8px;background:rgba(13,31,60,0.7);
-  border:1px solid var(--bdr);border-left:3px solid transparent;
-  border-radius:5px;padding:5px 10px;
-  cursor:pointer;transition:all .18s;white-space:nowrap}
-.srp-tile:hover{background:rgba(46,143,228,0.08);border-color:var(--bdr2)}
-.srp-tile.active{background:rgba(46,143,228,0.14);border-color:var(--acc2)}
-.srp-sname{font-size:10px;font-family:var(--mono);font-weight:700}
-.srp-val{font-size:13px;font-weight:700;font-family:var(--mono)}
+.srsi-panel{background:var(--surf);border-bottom:2px solid var(--bdr2);padding:10px 20px 12px;display:block}
+.srsi-hdr{display:flex;align-items:center;gap:10px;margin-bottom:9px}
+.srsi-title{font-family:var(--mono);font-size:11px;font-weight:600;color:var(--mu);
+  text-transform:uppercase;letter-spacing:.08em}
+.srsi-sub{font-size:9px;color:var(--dim);font-family:var(--mono)}
+.srsi-exch-tabs{display:flex;gap:0;background:var(--bg);border:1px solid var(--bdr2);
+  border-radius:5px;overflow:hidden;margin-left:auto}
+.srsi-tab{padding:3px 11px;font-size:10px;font-weight:600;font-family:var(--mono);
+  cursor:pointer;border:none;background:transparent;color:var(--dim);transition:.12s}
+.srsi-tab:hover{color:var(--txt);background:var(--surf2)}
+.srsi-tab.active{color:var(--txt);background:var(--surf2)}
+.srsi-tab+.srsi-tab{border-left:1px solid var(--bdr)}
+.srsi-grid{display:flex;flex-wrap:wrap;gap:7px}
+.srsi-card{display:flex;flex-direction:column;align-items:center;justify-content:center;
+  min-width:88px;padding:7px 10px 6px;border-radius:7px;border:1px solid var(--bdr2);
+  background:var(--bg);gap:2px;cursor:default;transition:border-color .15s}
+.srsi-card:hover{border-color:var(--bdr2);filter:brightness(1.12)}
+.srsi-card.hot {border-color:rgba(255,76,91,0.40); background:rgba(255,76,91,0.07)}
+.srsi-card.bull{border-color:rgba(0,209,122,0.35);  background:rgba(0,209,122,0.06)}
+.srsi-card.mid {border-color:var(--bdr2)}
+.srsi-card.fade{border-color:rgba(255,140,66,0.38); background:rgba(255,140,66,0.06)}
+.srsi-card.os  {border-color:rgba(76,159,255,0.40); background:rgba(76,159,255,0.07)}
+.srsi-card.na  {border-color:var(--bdr);opacity:.55}
+.srsi-val{font-family:var(--mono);font-size:17px;font-weight:700;line-height:1.1}
+.srsi-val.hot {color:#ff4c5b}
+.srsi-val.bull{color:#00d17a}
+.srsi-val.mid {color:var(--mu)}
+.srsi-val.fade{color:#ff8c42}
+.srsi-val.os  {color:#4c9fff}
+.srsi-val.na  {color:var(--dim)}
+.srsi-lbl{font-size:9px;color:var(--dim);font-family:var(--mono);text-align:center;
+  white-space:nowrap;max-width:86px;overflow:hidden;text-overflow:ellipsis}
+.srsi-zone-tag{font-size:8px;font-family:var(--mono);font-weight:600;
+  padding:1px 5px;border-radius:3px;margin-top:1px}
+.srsi-zone-tag.hot {background:rgba(255,76,91,0.15); color:#ff4c5b}
+.srsi-zone-tag.bull{background:rgba(0,209,122,0.15); color:#00d17a}
+.srsi-zone-tag.mid {background:var(--surf2);          color:var(--dim)}
+.srsi-zone-tag.fade{background:rgba(255,140,66,0.15); color:#ff8c42}
+.srsi-zone-tag.os  {background:rgba(76,159,255,0.15); color:#4c9fff}
+.srsi-zone-tag.na  {background:var(--surf2);          color:var(--dim)}
+.srsi-bar-wrap{width:100%;height:3px;background:var(--bdr2);border-radius:2px;margin-top:3px;overflow:hidden}
+.srsi-bar{height:100%;border-radius:2px;transition:width .4s ease}
 
-/* ── EXCHANGE PANELS ── */
-.panel{display:none;padding:12px 14px 20px}
-.panel.active{display:block}
+/* ── FOOTER ── */
+footer{text-align:center;padding:12px 20px;border-top:1px solid var(--bdr);
+  color:var(--dim);font-size:10px;font-family:var(--mono);line-height:2}
+footer a{color:var(--acc);text-decoration:none}
 
-/* ── CARD GRID ── */
-.card-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(305px,1fr));gap:10px}
+/* ── VOL SPIKE ALERT PANEL ── */
+.vs-alert-panel{background:linear-gradient(135deg,rgba(245,200,66,0.06),rgba(76,159,255,0.04));
+  border-bottom:2px solid rgba(245,200,66,0.25);padding:10px 20px 14px;display:none}
+.vs-alert-panel.has-data{display:block}
+.vs-alert-hdr{display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap}
+.vs-alert-title{font-family:var(--mono);font-size:11px;font-weight:600;
+  color:var(--gold);text-transform:uppercase;letter-spacing:.08em}
+.vs-alert-sub{font-size:9px;color:var(--dim);font-family:var(--mono)}
+.vs-alert-count{font-family:var(--mono);font-size:10px;background:rgba(245,200,66,0.12);
+  border:1px solid rgba(245,200,66,0.3);color:var(--gold);border-radius:4px;padding:2px 8px}
+.vs-cards{display:flex;flex-wrap:wrap;gap:8px}
+.vs-card{background:var(--surf);border:1px solid var(--bdr2);border-radius:8px;
+  padding:9px 12px;min-width:148px;max-width:180px;cursor:default;
+  transition:border-color .15s,filter .15s;position:relative}
+.vs-card:hover{filter:brightness(1.12)}
+.vs-card.has-signal{border-color:rgba(76,159,255,0.5);background:rgba(76,159,255,0.06)}
+.vs-card.dir-up  {border-left:3px solid var(--bull)}
+.vs-card.dir-down{border-left:3px solid var(--bear)}
+.vs-card-ticker{font-family:var(--mono);font-size:13px;font-weight:700;color:#fff}
+.vs-card-name{font-size:9px;color:var(--dim);white-space:nowrap;overflow:hidden;
+  text-overflow:ellipsis;max-width:155px;margin-top:1px}
+.vs-card-row{display:flex;align-items:center;justify-content:space-between;margin-top:5px}
+.vs-vol-ratio{font-family:var(--mono);font-size:15px;font-weight:700;color:var(--gold)}
+.vs-vol-label{font-size:8px;color:var(--dim);font-family:var(--mono)}
+.vs-chg{font-family:var(--mono);font-size:11px;font-weight:600}
+.vs-chg.up{color:var(--bull)}.vs-chg.down{color:var(--bear)}
+.vs-signal-tag{font-size:8px;font-family:var(--mono);font-weight:700;
+  background:rgba(76,159,255,0.15);border:1px solid rgba(76,159,255,0.4);
+  color:#4c9fff;border-radius:3px;padding:1px 5px;margin-top:4px;display:inline-block}
+.vs-exch-dot{width:5px;height:5px;border-radius:50%;display:inline-block;margin-right:3px}
+.vs-exch-dot.nse{background:#ff9933}.vs-exch-dot.nyse{background:#5b8fff}
 
-/* ── STOCK CARDS ── */
-.card{background:var(--nb2);border:1px solid var(--bdr);border-left:3px solid transparent;
-  border-radius:8px;padding:12px 13px;overflow:hidden;transition:border-color .15s}
-.card:hover{border-color:var(--bdr2)}
-.card.bull{border-left-color:var(--bu)}
-.card.bear{border-left-color:var(--be)}
-.card.mix {border-left-color:var(--mx)}
+/* ── VOL SPIKE TAB ── */
+.main-tabs{display:flex;gap:0;background:var(--surf);border-bottom:2px solid var(--bdr2);
+  padding:0 20px}
+.main-tab{padding:10px 18px;font-size:11px;font-weight:600;font-family:var(--mono);
+  cursor:pointer;border:none;background:transparent;color:var(--dim);
+  border-bottom:2px solid transparent;margin-bottom:-2px;transition:.12s;white-space:nowrap}
+.main-tab:hover{color:var(--txt)}
+.main-tab.active{color:var(--txt);border-bottom-color:var(--acc)}
+.main-tab.vs-tab.active{color:var(--gold);border-bottom-color:var(--gold)}
+.tab-panel{display:none}.tab-panel.active{display:block}
 
-.c-head{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px}
-.c-left{min-width:0}
-.c-ticker{font-family:var(--mono);font-size:15px;font-weight:700;color:#fff;letter-spacing:.3px}
-.c-name{font-size:11px;color:var(--mu);margin-top:2px;
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:165px}
-.c-right{display:flex;flex-direction:column;align-items:flex-end;gap:4px;flex-shrink:0;margin-left:8px}
-.c-sect{font-size:10px;color:var(--mu);background:rgba(255,255,255,0.05);
-  border:1px solid var(--bdr);padding:1px 7px;border-radius:3px;
-  font-family:var(--mono);white-space:nowrap}
-.c-badge{font-size:11px;font-weight:700;padding:2px 9px;border-radius:10px;
-  font-family:var(--mono);white-space:nowrap}
-.c-badge.bull{background:rgba(52,217,123,0.15);color:var(--bu);border:1px solid rgba(52,217,123,0.35)}
-.c-badge.bear{background:rgba(248,113,113,0.15);color:var(--be);border:1px solid rgba(248,113,113,0.35)}
-.c-badge.mix {background:rgba(251,191,36,0.15);color:var(--mx);border:1px solid rgba(251,191,36,0.35)}
+/* Vol spike table */
+.vs-tbl-wrap{overflow-x:auto;padding:0 20px 32px}
+.vs-filters{display:flex;gap:8px;padding:10px 20px;border-bottom:1px solid var(--bdr);
+  background:var(--surf);flex-wrap:wrap;align-items:center}
+.vs-filter-label{font-size:10px;color:var(--dim);font-family:var(--mono)}
+#vs-ratio-slider{accent-color:var(--gold);cursor:pointer;width:120px}
+#vs-ratio-val{font-family:var(--mono);font-size:11px;color:var(--gold);min-width:32px}
+.vs-sort-note{font-size:10px;color:var(--dim);font-family:var(--mono);margin-left:auto}
 
-.c-prow{display:flex;gap:8px;align-items:center;flex-wrap:wrap;
-  padding:7px 0;border-top:1px solid rgba(56,163,245,0.12);
-  border-bottom:1px solid rgba(56,163,245,0.12);margin-bottom:7px}
-.c-price{font-family:var(--mono);font-size:13px;font-weight:700;color:#fff}
-.c-chg{font-family:var(--mono);font-size:12px;font-weight:700}
-.c-chg.up{color:var(--bu)}.c-chg.dn{color:var(--be)}
-.c-rsi{font-size:10px;padding:2px 6px;border-radius:3px;font-family:var(--mono);
-  background:rgba(240,246,255,0.08);color:#e8f2ff;font-weight:500}
-.c-rsi.bull{background:rgba(52,217,123,0.18);color:var(--bu)}
-.c-rsi.bear{background:rgba(248,113,113,0.18);color:var(--be)}
-.c-rsi.mix{background:rgba(240,246,255,0.1);color:#e8f2ff}
-.c-vol{font-size:10px;color:var(--mu);font-family:var(--mono)}
-.c-vol.vok{color:var(--bu)}
-.c-tl{font-size:10px;color:var(--acc3);font-family:var(--mono)}
+/* ── SCROLLBAR ── */
+::-webkit-scrollbar{height:4px;width:4px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--bdr2);border-radius:2px}
 
-.sig-block{max-height:0;overflow:hidden;opacity:0;
-  transition:max-height .28s ease, opacity .2s ease}
-.card.expanded .sig-block{max-height:1000px;opacity:1}
-
-.sig{display:flex;align-items:baseline;gap:5px;padding:3px 0;
-  border-bottom:1px solid rgba(56,163,245,0.08);font-size:11px}
-.sig:last-child{border-bottom:none}
-.sig-n{font-family:var(--mono);font-size:10px;background:rgba(255,255,255,0.06);
-  color:var(--acc3);padding:1px 5px;border-radius:3px;
-  flex-shrink:0;min-width:24px;text-align:center}
-.sig-t{color:var(--txt);flex:1;line-height:1.35}
-.sig-d{flex-shrink:0;font-size:10px;font-weight:700}
-.sig-d.up{color:var(--bu)}.sig-d.dn{color:var(--be)}
-
-.sig-detail{font-size:10px;color:var(--mu);font-style:italic;
-  padding:0 0 0 29px;line-height:1.3;max-height:0;overflow:hidden;
-  opacity:0;transition:max-height .22s ease, opacity .18s ease, padding .18s ease}
-.card.expanded .sig-detail{max-height:60px;opacity:1;padding:1px 0 4px 29px}
-
-.c-toggle{display:flex;align-items:center;gap:4px;margin-top:7px;
-  padding:3px 9px;border-radius:10px;font-size:10px;font-family:var(--mono);
-  font-weight:700;cursor:pointer;border:1px solid var(--bdr);
-  background:rgba(255,255,255,0.04);color:var(--mu);
-  width:fit-content;transition:all .15s;user-select:none}
-.c-toggle:hover{border-color:var(--acc2);color:var(--acc2)}
-.card.expanded .c-toggle{background:rgba(46,143,228,0.1);
-  border-color:var(--bdr2);color:var(--acc2)}
-.c-toggle-arrow{display:inline-block;transition:transform .2s ease;font-size:9px}
-.card.expanded .c-toggle-arrow{transform:rotate(180deg)}
-
-.lgnd{margin:14px 0 0;background:rgba(0,0,0,0.2);border:1px solid var(--bdr);
-  border-radius:7px;padding:10px 12px}
-.lgt{font-size:9px;letter-spacing:.5px;color:var(--acc3);text-transform:uppercase;
-  font-family:var(--mono);margin-bottom:8px}
-.lgg{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:3px}
-.lgi{font-size:10px;display:flex;align-items:center;gap:5px;padding:1px 0}
-.ln{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;
-  background:rgba(96,184,255,0.15);border:1px solid rgba(96,184,255,0.35);border-radius:3px;
-  font-size:9px;font-family:var(--mono);color:var(--acc3);flex-shrink:0;font-weight:700}
-.lhit{background:rgba(52,217,123,0.15);color:var(--bu);
-  border:1px solid rgba(52,217,123,0.35);border-radius:3px;
-  padding:0 5px;font-family:var(--mono);font-size:9px;margin-left:auto}
-
-.empty{text-align:center;color:var(--mu);padding:40px 20px;font-family:var(--mono);font-size:12px}
-
-footer{text-align:center;padding:12px;border-top:1px solid var(--bdr);
-  color:var(--mu);font-size:10px;font-family:var(--mono);line-height:2}
-footer a{color:var(--acc2);text-decoration:none}
-
-.clock-wrap{display:flex;align-items:center;gap:10px;font-family:var(--mono)}
-.clock-item{display:flex;flex-direction:column;align-items:center;gap:1px}
-.clock-time{font-size:12px;font-weight:700;color:var(--acc2);letter-spacing:.5px;white-space:nowrap}
-.clock-lbl{font-size:9px;color:var(--acc3);letter-spacing:.6px;text-transform:uppercase}
-.clock-sep{color:var(--bdr2);font-size:14px;line-height:1}
-
-@media(max-width:600px){
-  .topbar{padding:6px 10px}
-  .panel{padding:8px 8px 14px}
-  .card-grid{grid-template-columns:1fr}
-  .stats .sl{display:none}
+@media(max-width:640px){
+  .topbar{padding:7px 12px}.toolbar{padding:8px 12px}.tbl-wrap{padding:0 8px 24px}
+  .clock-wrap{display:none}
 }
 </style></head><body>
 
+<!-- TOP BAR -->
 <div class="topbar">
-  <div class="logo">
-    <div class="logo-icon">
-      <svg viewBox="0 0 14 14"><polyline points="1,11 4,6 7,8 10,3 13,5"/><line x1="13" y1="1" x2="13" y2="5"/><line x1="13" y1="5" x2="9" y2="5"/></svg>
+  <div class="brand">
+    <div class="brand-icon">
+      <svg viewBox="0 0 14 14"><polyline points="1,11 4,6 7,8 10,3 13,5"/>
+        <line x1="13" y1="1" x2="13" y2="5"/><line x1="13" y1="5" x2="9" y2="5"/></svg>
     </div>
     <div>
-      <div class="logo-name">TrendBreak Pro</div>
-      <div class="logo-sub">20 Trendline Types &middot; NSE + NYSE</div>
+      <div class="brand-name">TrendBreak Pro</div>
+      <div class="brand-sub">v2 &middot; 20 TL types &middot; 13 fixes applied</div>
     </div>
   </div>
   <div class="vsep"></div>
-  <div class="topbadges">
-    <div class="tbadge"><span class="pulse"></span>%%SCAN_TIME%%</div>
-    <div class="tbadge">&#128208; 20 Detectors</div>
-    <div class="tbadge">&#127470;&#127475; NSE &middot; &#127482;&#127480; NYSE</div>
-  </div>
-  <div class="vsep"></div>
+  <div class="tbadge"><span class="pulse"></span>%%SCAN_TIME%%</div>
+  <div class="tbadge">%%SCANNED%% stocks scanned</div>
+  <div class="tbadge" style="background:linear-gradient(135deg,rgba(255,153,51,0.1),rgba(60,100,200,0.1));border-color:rgba(255,153,51,0.35)">&#127470;&#127475; <span style="color:#ff9933">NSE</span> <span style="color:var(--dim)">+</span> &#127482;&#127480; <span style="color:#5b8fff">NYSE</span></div>
+  <div class="tbadge" id="tf-badge" style="color:var(--gold);border-color:var(--gold);background:rgba(245,200,66,0.09)">&#9201; %%TF_LABEL%%</div>
   <div class="clock-wrap">
     <div class="clock-item">
       <span id="clk-ist" class="clock-time">--:--:--</span>
@@ -1353,48 +1799,203 @@ footer a{color:var(--acc2);text-decoration:none}
   </div>
 </div>
 
+<!-- STATS STRIP -->
 <div class="stats">
-  <div class="sc"><div class="sn" id="stat-total" style="color:var(--acc2)">%%TOTAL%%</div><div class="sl">Signals</div></div>
-  <div class="sc"><div class="sn" id="stat-bull"  style="color:var(--bu)">%%BULL%%</div><div class="sl">Bullish</div></div>
-  <div class="sc"><div class="sn" id="stat-bear"  style="color:var(--be)">%%BEAR%%</div><div class="sl">Bearish</div></div>
-  <div class="sc"><div class="sn" style="color:var(--nse)">%%NSE%%</div><div class="sl">NSE</div></div>
-  <div class="sc"><div class="sn" style="color:var(--nyse)">%%NYSE%%</div><div class="sl">NYSE</div></div>
-  <div class="sc"><div class="sn" id="stat-vol"   style="color:var(--acc3)">%%VOL%%</div><div class="sl">Vol &#10003;</div></div>
-  <div class="sc"><div class="sn" style="color:var(--mu)">%%SCANNED%%</div><div class="sl">Scanned</div></div>
-  <div class="sc"><div class="sn" style="color:var(--mu)">20</div><div class="sl">TL Types</div></div>
+  <div class="sc"><div class="sn" style="color:var(--acc)" id="stat-total">%%TOTAL%%</div><div class="sl">Signals</div></div>
+  <div class="sc"><div class="sn" style="color:var(--bull)" id="stat-bull">%%BULL%%</div><div class="sl">Bullish</div></div>
+  <div class="sc"><div class="sn" style="color:var(--bear)" id="stat-bear">%%BEAR%%</div><div class="sl">Bearish</div></div>
+  <div class="sc"><div class="sn" style="color:#ff9933">%%NSE%%</div><div class="sl" style="color:#ff9933;opacity:.7">&#127470;&#127475; NSE</div></div>
+  <div class="sc"><div class="sn" style="color:#5b8fff">%%NYSE%%</div><div class="sl" style="color:#5b8fff;opacity:.7">&#127482;&#127480; NYSE</div></div>
+  <div class="sc"><div class="sn" style="color:var(--bull)" id="stat-vol">%%VOL%%</div><div class="sl">Vol &#10003;</div></div>
+  <div class="sc"><div class="sn" style="color:var(--dim)">%%SCANNED%%</div><div class="sl">Scanned</div></div>
+  <div class="sc"><div class="sn" style="color:var(--dim)">20</div><div class="sl">TL Types</div></div>
+  <div class="sc"><div class="sn" style="color:var(--gold);font-size:13px">%%TF_LABEL%%</div><div class="sl">Timeframe</div></div>
 </div>
 
-<div class="filterbar" id="filterbar">
-  <button class="btn on" id="btn-nse" onclick="switchExch('nse')">&#127470;&#127475; NSE India</button>
-  <button class="btn" id="btn-nyse" onclick="switchExch('nyse')">&#127482;&#127480; NYSE</button>
-  <span class="fb-sep"></span>
-  <button class="btn on" id="btn-all"  onclick="setDir('all')">All</button>
-  <button class="btn" id="btn-bull" onclick="setDir('bull')">&#9650; Bullish</button>
-  <button class="btn" id="btn-bear" onclick="setDir('bear')">&#9660; Bearish</button>
-  <span class="fb-sep"></span>
-  <select class="tb-sect" id="sect-select" onchange="setSect(this.value)">
-    <option value="">All sectors</option>
+<!-- SECTOR RSI PANEL -->
+<div class="srsi-panel" id="srsi-panel">
+  <div class="srsi-hdr">
+    <div>
+      <div class="srsi-title">&#128200; Sector RSI &mdash; Daily</div>
+      <div class="srsi-sub">14-period RSI on daily candles &middot; updates on exchange filter</div>
+    </div>
+    <div class="srsi-exch-tabs" id="srsi-tabs">
+      <button class="srsi-tab active" id="srsi-tab-nse"  onclick="setSrsiExch('NSE')">&#127470;&#127475; NSE</button>
+      <button class="srsi-tab"        id="srsi-tab-nyse" onclick="setSrsiExch('NYSE')">&#127482;&#127480; NYSE</button>
+    </div>
+  </div>
+  <div class="srsi-grid" id="srsi-grid"></div>
+</div>
+
+<!-- VOLUME SPIKE ALERT PANEL -->
+<div class="vs-alert-panel" id="vs-alert-panel">
+  <div class="vs-alert-hdr">
+    <div>
+      <div class="vs-alert-title">&#9889; Volume Spike Alert</div>
+      <div class="vs-alert-sub">Top spikes this candle &middot; sorted by vol ratio &middot; click tab for full table</div>
+    </div>
+    <span class="vs-alert-count" id="vs-alert-count">0 spikes</span>
+    <span class="vs-alert-sub" style="margin-left:4px">Showing top 12</span>
+  </div>
+  <div class="vs-cards" id="vs-alert-cards"></div>
+</div>
+
+<!-- MAIN TABS -->
+<div class="main-tabs">
+  <button class="main-tab active" id="tab-btn-signals" onclick="switchTab('signals')">&#128200; Trendline Signals</button>
+  <button class="main-tab vs-tab"  id="tab-btn-volspike" onclick="switchTab('volspike')">&#9889; Volume Spikes <span id="vs-tab-count" style="font-size:9px;opacity:.7"></span></button>
+</div>
+
+<!-- TAB: TRENDLINE SIGNALS -->
+<div class="tab-panel active" id="tab-signals">
+
+<!-- TOOLBAR -->
+<div class="toolbar">
+  <div class="search-wrap">
+    <svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+    <input class="search" id="searchbox" type="text" placeholder="ticker or name&#8230;" oninput="render()">
+  </div>
+
+  <div class="btn-grp" id="exch-btns">
+    <button class="bg-btn active" onclick="setExch('ALL')">All</button>
+    <button class="bg-btn nse-btn" onclick="setExch('NSE')">&#127470;&#127475; NSE</button>
+    <button class="bg-btn nyse-btn" onclick="setExch('NYSE')">&#127482;&#127480; NYSE</button>
+  </div>
+
+  <div class="btn-grp" id="dir-btns">
+    <button class="bg-btn active" onclick="setDir('all')">All</button>
+    <button class="bg-btn" onclick="setDir('bull')">&#9650; Bull</button>
+    <button class="bg-btn" onclick="setDir('bear')">&#9660; Bear</button>
+  </div>
+
+  <select class="flt" id="sect-sel" onchange="render()"><option value="">All Sectors</option></select>
+
+  <select class="flt" id="rsi-sel" onchange="render()">
+    <option value="">All RSI Zones</option>
+    <option value="HOT">🔴 HOT (&gt;70)</option>
+    <option value="Bull">🟢 Bull (55&ndash;70)</option>
+    <option value="Mid">⚪ Mid (45&ndash;55)</option>
+    <option value="Fade">🟠 Fade (30&ndash;45)</option>
+    <option value="OS">🔵 OS (&lt;30)</option>
   </select>
-  <span class="result-count" id="result-count"></span>
+
+  <label class="vol-lbl"><input type="checkbox" id="vol-chk" onchange="render()"> Vol confirmed</label>
+
+  <select class="flt" id="tf-sel" onchange="applyTimeframe(this.value)" title="Timeframe — re-run scanner with selected interval">
+    <option value="1d" %%TF_SEL_1D%%>&#128198; 1 Day</option>
+    <option value="4h" %%TF_SEL_4H%%>&#9202; 4 Hour</option>
+    <option value="1h" %%TF_SEL_1H%%>&#9202; 1 Hour</option>
+    <option value="15m" %%TF_SEL_15M%%>&#9202; 15 Min</option>
+  </select>
+
+  <select class="flt" id="topvol-sel" onchange="render()">
+    <option value="0">All by Volume</option>
+    <option value="5">Top 5 Vol</option>
+    <option value="10">Top 10 Vol</option>
+    <option value="20">Top 20 Vol</option>
+  </select>
+
+  <button class="lgnd-toggle" onclick="toggleLgnd()">&#9656; TL Types (20)</button>
+  <span class="rc" id="rc-txt"></span>
 </div>
 
-<div id="srp-nse"  class="srp"></div>
-<div id="srp-nyse" class="srp" style="display:none"></div>
+<!-- LEGEND PANEL -->
+<div class="lgnd-panel" id="lgnd-panel">
+  <div class="lgnd-item"><b>#1</b>Uptrend Line</div>
+  <div class="lgnd-item"><b>#2</b>Downtrend Line</div>
+  <div class="lgnd-item"><b>#3</b>Horizontal Sup/Res</div>
+  <div class="lgnd-item"><b>#4</b>Channel (Asc/Desc/Sideways)</div>
+  <div class="lgnd-item"><b>#5</b>Triangle (Sym/Asc/Desc)</div>
+  <div class="lgnd-item"><b>#6</b>Wedge (Rising/Falling)</div>
+  <div class="lgnd-item"><b>#7</b>Flag &amp; Pennant</div>
+  <div class="lgnd-item"><b>#8</b>Fan Lines (3-Fan System)</div>
+  <div class="lgnd-item"><b>#9</b>Internal TL (Regression)</div>
+  <div class="lgnd-item"><b>#10</b>Dynamic EMA (20/50/200)</div>
+  <div class="lgnd-item"><b>#11</b>Neckline (H&amp;S / Inv H&amp;S)</div>
+  <div class="lgnd-item"><b>#12</b>Fibonacci TL</div>
+  <div class="lgnd-item"><b>#13</b>Pitchfork (Andrews)</div>
+  <div class="lgnd-item"><b>#14</b>Regression Channel</div>
+  <div class="lgnd-item"><b>#15</b>Acceleration / Parabolic</div>
+  <div class="lgnd-item"><b>#16</b>Base TL (Accumulation)</div>
+  <div class="lgnd-item"><b>#17</b>Role Reversal (Polarity)</div>
+  <div class="lgnd-item"><b>#18</b>Speed Resistance Lines</div>
+  <div class="lgnd-item"><b>#19</b>Body TL (No-Wick)</div>
+  <div class="lgnd-item"><b>#20</b>Gann Angle (1&times;1 = 45&deg;)</div>
+</div>
 
-<div id="panel-nse" class="panel active">
-  <div class="card-grid" id="grid-nse"></div>
-  <div class="lgnd">
-    <div class="lgt">&#128218; Trendline coverage &mdash; NSE</div>
-    <div class="lgg" id="lgnd-nse"></div>
-  </div>
+<!-- DATA TABLE -->
+<div class="tbl-wrap">
+<table id="main-tbl">
+  <thead>
+    <tr>
+      <th onclick="sortBy('ticker')">Ticker <span class="sa">&#8597;</span></th>
+      <th onclick="sortBy('name')">Company <span class="sa">&#8597;</span></th>
+      <th onclick="sortBy('sector')">Sector <span class="sa">&#8597;</span></th>
+      <th onclick="sortBy('exchange')">Exch <span class="sa">&#8597;</span></th>
+      <th onclick="sortBy('price')" style="text-align:right">Price <span class="sa">&#8597;</span></th>
+      <th onclick="sortBy('change')" style="text-align:right">Chg% <span class="sa">&#8597;</span></th>
+      <th onclick="sortBy('signal')">Signal <span class="sa">&#8597;</span></th>
+      <th onclick="sortBy('rsi')" style="text-align:right">RSI <span class="sa">&#8597;</span></th>
+      <th onclick="sortBy('srsi')" style="text-align:right">Sect RSI <span class="sa">&#8597;</span></th>
+      <th onclick="sortBy('vol_ratio')" style="text-align:right">Vol <span class="sa">&#8597;</span></th>
+      <th onclick="sortBy('num')">TL Type <span class="sa">&#8597;</span></th>
+      <th>Signal Detail</th>
+      <th onclick="sortBy('tl')" style="text-align:right">TL Level <span class="sa">&#8597;</span></th>
+    </tr>
+  </thead>
+  <tbody id="tbl-body"></tbody>
+</table>
 </div>
-<div id="panel-nyse" class="panel">
-  <div class="card-grid" id="grid-nyse"></div>
-  <div class="lgnd">
-    <div class="lgt">&#128218; Trendline coverage &mdash; NYSE</div>
-    <div class="lgg" id="lgnd-nyse"></div>
+
+</div><!-- end tab-signals -->
+
+<!-- TAB: VOLUME SPIKES -->
+<div class="tab-panel" id="tab-volspike">
+  <div class="vs-filters">
+    <span class="vs-filter-label">Min Vol Ratio:</span>
+    <input type="range" id="vs-ratio-slider" min="0.5" max="10" step="0.5" value="1" oninput="renderVsTab()">
+    <span id="vs-ratio-val">1x</span>
+
+    <div class="btn-grp" style="margin-left:8px">
+      <button class="bg-btn active" id="vs-exch-all"  onclick="setVsExch('ALL')">All</button>
+      <button class="bg-btn nse-btn"  id="vs-exch-nse"  onclick="setVsExch('NSE')">&#127470;&#127475; NSE</button>
+      <button class="bg-btn nyse-btn" id="vs-exch-nyse" onclick="setVsExch('NYSE')">&#127482;&#127480; NYSE</button>
+    </div>
+
+    <div class="btn-grp" style="margin-left:4px">
+      <button class="bg-btn active" id="vs-dir-all"  onclick="setVsDir('ALL')">All</button>
+      <button class="bg-btn" id="vs-dir-up"   onclick="setVsDir('UP')"  style="color:var(--bull)">&#9650; Up</button>
+      <button class="bg-btn" id="vs-dir-down" onclick="setVsDir('DOWN')" style="color:var(--bear)">&#9660; Down</button>
+    </div>
+
+    <label class="vol-lbl" style="margin-left:4px">
+      <input type="checkbox" id="vs-sig-only" onchange="renderVsTab()"> Breakout signal only
+    </label>
+
+    <span class="vs-sort-note" id="vs-row-count"></span>
   </div>
-</div>
+
+  <div class="vs-tbl-wrap">
+  <table id="vs-tbl" style="min-width:900px">
+    <thead><tr>
+      <th onclick="vsSort('candle_time')">Candle Time (IST) <span class="sa">&#8597;</span></th>
+      <th onclick="vsSort('ticker')">Ticker <span class="sa">&#8597;</span></th>
+      <th onclick="vsSort('name')">Company <span class="sa">&#8597;</span></th>
+      <th onclick="vsSort('sector')">Sector <span class="sa">&#8597;</span></th>
+      <th onclick="vsSort('exchange')">Exch <span class="sa">&#8597;</span></th>
+      <th onclick="vsSort('price')" style="text-align:right">Price <span class="sa">&#8597;</span></th>
+      <th onclick="vsSort('candle_chg')" style="text-align:right">Candle Chg% <span class="sa">&#8597;</span></th>
+      <th onclick="vsSort('candle_body')" style="text-align:right">Body% <span class="sa">&#8597;</span></th>
+      <th onclick="vsSort('candle_range')" style="text-align:right">Range% <span class="sa">&#8597;</span></th>
+      <th onclick="vsSort('vol_ratio')" style="text-align:right">Vol Ratio <span class="sa">&#8597;</span></th>
+      <th onclick="vsSort('cur_vol')" style="text-align:right">Cur Vol <span class="sa">&#8597;</span></th>
+      <th onclick="vsSort('avg_vol')" style="text-align:right">Avg Vol <span class="sa">&#8597;</span></th>
+      <th onclick="vsSort('has_breakout')">TL Breakout <span class="sa">&#8597;</span></th>
+    </tr></thead>
+    <tbody id="vs-tbl-body"></tbody>
+  </table>
+  </div>
+</div><!-- end tab-volspike -->
 
 <footer>
   &#9888; Educational &amp; research purposes only &middot; Not financial advice &middot; Not SEBI/SEC registered<br>
@@ -1406,293 +2007,312 @@ footer a{color:var(--acc2);text-decoration:none}
 
 <script type="application/json" id="data-nse">%%NSE_DATA%%</script>
 <script type="application/json" id="data-nyse">%%NYSE_DATA%%</script>
+<script type="application/json" id="data-vol-spikes">%%VOL_SPIKE_DATA%%</script>
+<script type="application/json" id="data-nse-srsi">%%NSE_SRSI%%</script>
+<script type="application/json" id="data-nyse-srsi">%%NYSE_SRSI%%</script>
 
 <script>
-var S={exch:'nse',dir:'all',sect:''};
-var DATA={};
+/* ── SECTOR RSI PANEL ──────────────────────────────────────────────────── */
+var SRSI_DATA={NSE:[],NYSE:[]};
+(function(){
+  function loadSRSI(id){
+    var el=document.getElementById(id);
+    if(!el)return[];
+    try{return JSON.parse(el.textContent);}catch(e){return[];}
+  }
+  SRSI_DATA.NSE =loadSRSI('data-nse-srsi');
+  SRSI_DATA.NYSE=loadSRSI('data-nyse-srsi');
+})();
 
-var TL_CAT={
+var SRSI_EXCH='NSE'; // tracks which exchange the panel shows
+
+// sector label → zone lookup map, rebuilt whenever panel switches exchange
+var SECT_ZONE_MAP={};
+function buildSectZoneMap(exch){
+  SECT_ZONE_MAP={};
+  var data=SRSI_DATA[exch]||[];
+  data.forEach(function(s){
+    if(s.label&&s.zone) SECT_ZONE_MAP[s.label]=s.zone;
+  });
+}
+function sectZoneCls(label){
+  var zone=SECT_ZONE_MAP[label]||'';
+  if(zone==='HOT') return'sz-hot';
+  if(zone==='Bull')return'sz-bull';
+  if(zone==='Mid') return'sz-mid';
+  if(zone==='Fade')return'sz-fade';
+  if(zone==='OS')  return'sz-os';
+  return'';
+}
+// initialise with NSE
+buildSectZoneMap('NSE');
+
+function zoneClass(zone){
+  if(zone==='HOT') return'hot';
+  if(zone==='Bull')return'bull';
+  if(zone==='Mid') return'mid';
+  if(zone==='Fade')return'fade';
+  if(zone==='OS')  return'os';
+  return'na';
+}
+function barColor(cls){
+  if(cls==='hot') return'#ff4c5b';
+  if(cls==='bull')return'#00d17a';
+  if(cls==='fade')return'#ff8c42';
+  if(cls==='os')  return'#4c9fff';
+  return'var(--mu)';
+}
+
+function renderSrsiPanel(exch){
+  var data=SRSI_DATA[exch]||[];
+  var grid=document.getElementById('srsi-grid');
+  if(!grid)return;
+  if(!data.length){grid.innerHTML='<span style="font-size:11px;color:var(--dim);font-family:var(--mono)">No sector RSI data available</span>';return;}
+  var html='';
+  data.forEach(function(s){
+    var rsi=s.rsi;
+    var zone=s.zone||'—';
+    var cls=zoneClass(zone);
+    var val=rsi!==null&&rsi!==undefined?parseFloat(rsi).toFixed(1):'—';
+    var barW=rsi!==null&&rsi!==undefined?Math.round(parseFloat(rsi))+'%':'0%';
+    var bColor=barColor(cls);
+    html+='<div class="srsi-card '+cls+'" title="'+s.label+': RSI '+val+' ('+zone+')">'
+      +'<div class="srsi-val '+cls+'">'+val+'</div>'
+      +'<div class="srsi-lbl">'+s.label+'</div>'
+      +'<div class="srsi-zone-tag '+cls+'">'+zone+'</div>'
+      +'<div class="srsi-bar-wrap"><div class="srsi-bar" style="width:'+barW+';background:'+bColor+'"></div></div>'
+      +'</div>';
+  });
+  grid.innerHTML=html;
+}
+
+function setSrsiExch(exch){
+  SRSI_EXCH=exch;
+  var tabs=document.querySelectorAll('.srsi-tab');
+  tabs.forEach(function(t){t.classList.remove('active');});
+  var target=document.getElementById('srsi-tab-'+exch.toLowerCase());
+  if(target)target.classList.add('active');
+  buildSectZoneMap(exch);
+  renderSrsiPanel(exch);
+  render(); // re-render table rows so sector badges update colour
+}
+
+// Auto-sync panel when exchange filter button is clicked
+function syncSrsiToExch(exch){
+  if(exch==='NSE'||exch==='NYSE'){
+    buildSectZoneMap(exch);
+    setSrsiExch(exch);
+  }
+  // If "ALL" selected keep panel as-is
+}
+
+/* ── END SECTOR RSI PANEL ─────────────────────────────────────────────── */
+
+var TL_NAMES={
   "1":"Uptrend Line","2":"Downtrend Line","3":"Horizontal",
   "4":"Channel","5":"Triangle","6":"Wedge",
   "7":"Flag & Pennant","8":"Fan Lines","9":"Internal TL",
-  "10":"Dynamic EMA","11":"Neckline (H&S)","12":"Fibonacci TL",
+  "10":"Dynamic EMA","11":"Neckline H&S","12":"Fibonacci TL",
   "13":"Pitchfork","14":"Regression Ch.","15":"Acceleration",
   "16":"Base TL","17":"Role Reversal","18":"Speed Resistance",
   "19":"Body TL","20":"Gann Angle"
 };
 
-function loadData(eid){
-  var el=document.getElementById('data-'+eid);
+var ALL_DATA=[];
+function loadJSON(id){
+  var el=document.getElementById(id);
   if(!el)return[];
   try{return JSON.parse(el.textContent);}catch(e){return[];}
 }
+(function(){
+  var nse=loadJSON('data-nse');
+  var nyse=loadJSON('data-nyse');
+  ALL_DATA=nse.concat(nyse);
+})();
 
-function groupByTicker(rows){
-  var m={};
-  for(var i=0;i<rows.length;i++){
-    var r=rows[i];
-    if(S.dir!=='all'){
-      var want=S.dir==='bull'?'BULLISH':'BEARISH';
-      if(r.signal!==want)continue;
-    }
-    if(S.sect&&r.sector!==S.sect)continue;
-    var k=r.ticker;
-    if(!m[k])m[k]={ticker:r.ticker,name:r.name,sector:r.sector,exchange:r.exchange,
-                    price:r.price,change:r.change,vol_ratio:r.vol_ratio,vol_ok:r.vol_ok,
-                    rsi:r.rsi,rsi_zone:r.rsi_zone,srsi:r.srsi,srsi_zone:r.srsi_zone,sigs:[]};
-    m[k].sigs.push({num:r.num,type:r.type,signal:r.signal,detail:r.detail,tl:r.tl});
-  }
-  var arr=Object.values(m);
-  arr.sort(function(a,b){return b.sigs.length-a.sigs.length;});
-  return arr;
+var S={exch:'ALL',dir:'all',sortCol:'',sortAsc:true};
+
+function rsiZone(v){
+  if(v===''||v===null||v===undefined)return'';
+  v=parseFloat(v);
+  if(v>70) return'HOT';
+  if(v>=55)return'Bull';
+  if(v>=45)return'Mid';
+  if(v>=30)return'Fade';
+  return'OS';
 }
-
-function cardDir(sigs){
-  var b=0;
-  for(var i=0;i<sigs.length;i++){if(sigs[i].signal==='BULLISH')b++;}
-  return b===sigs.length?'bull':b===0?'bear':'mix';
+function rsiCls(z){
+  if(z==='HOT') return'rz-hot';
+  if(z==='Bull')return'rz-bull';
+  if(z==='Mid') return'rz-mid';
+  if(z==='Fade')return'rz-fade';
+  if(z==='OS')  return'rz-os';
+  return'rz-na';
 }
-
-function fmtPrice(p,exch){
-  var sym=exch==='NSE'?'\u20b9':'$';
-  return sym+p.toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
-}
-
-function buildCard(s){
-  var d=cardDir(s.sigs);
-  var bc=s.sigs.filter(function(x){return x.signal==='BULLISH';}).length;
-  var rc=s.sigs.length-bc;
-  var badgeLabel=d==='bull'?s.sigs.length+' \u25b2 bull'
-                :d==='bear'?s.sigs.length+' \u25bc bear'
-                :bc+'\u25b2 '+rc+'\u25bc';
-  var rsiHtml=s.rsi!==''?'<span class="c-rsi '+d+'">RSI '+s.rsi+' &middot; '+s.rsi_zone+'</span>':'';
-  var volCls=s.vol_ok?'vok':'';
-  var volCheck=s.vol_ok?' \u2713':'';
-  var chgCls=s.change>=0?'up':'dn';
-  var chgSign=s.change>=0?'+':'';
-
-  var sigRows=s.sigs.map(function(sg){
-    var up=sg.signal==='BULLISH';
-    return '<div class="sig">'
-      +'<span class="sig-n">#'+sg.num+'</span>'
-      +'<span class="sig-t">'+sg.type+'</span>'
-      +'<span class="sig-d '+(up?'up':'dn')+'">'+(up?'\u25b2':'\u25bc')+'</span>'
-      +'</div>'
-      +'<div class="sig-detail">'+sg.detail+'</div>';
-  }).join('');
-
-  var uid='c'+Math.random().toString(36).substr(2,7);
-  return '<div class="card '+d+'" id="'+uid+'">'
-    +'<div class="c-head">'
-      +'<div class="c-left">'
-        +'<div class="c-ticker">'+s.ticker+'</div>'
-        +'<div class="c-name">'+s.name+'</div>'
-      +'</div>'
-      +'<div class="c-right">'
-        +'<span class="c-sect">'+s.sector+'</span>'
-        +'<span class="c-badge '+d+'">'+badgeLabel+'</span>'
-      +'</div>'
-    +'</div>'
-    +'<div class="c-prow">'
-      +'<span class="c-price">'+fmtPrice(s.price,s.exchange)+'</span>'
-      +'<span class="c-chg '+chgCls+'">'+chgSign+s.change+'%</span>'
-      +rsiHtml
-      +'<span class="c-vol '+volCls+'">'+s.vol_ratio+'x'+volCheck+'</span>'
-    +'</div>'
-    +'<div class="sig-block"><div>'+sigRows+'</div></div>'
-    +'<div class="c-toggle" onclick="toggleCard(\''+uid+'\')">'
-      +'<span class="c-toggle-arrow">&#9660;</span>'
-      +'<span class="c-toggle-lbl">details</span>'
-    +'</div>'
-    +'</div>';
-}
-
-function toggleCard(uid){
-  var el=document.getElementById(uid);
-  if(!el)return;
-  var expanded=el.classList.toggle('expanded');
-  var lbl=el.querySelector('.c-toggle-lbl');
-  if(lbl)lbl.textContent=expanded?'hide details':'details';
-}
-
-var SECT_COL={
-  'Banking':       '#3b82f6',
-  'Fin. Services': '#8b5cf6',
-  'IT':            '#22d3ee',
-  'Auto':          '#f97316',
-  'Cons. Goods':   '#ec4899',
-  'FMCG':          '#10b981',
-  'Infra/Defence': '#6366f1',
-  'Metals':        '#94a3b8',
-  'Pharma':        '#14b8a6',
-  'Energy':        '#f59e0b',
-  'Technology':    '#22d3ee',
-  'Financials':    '#3b82f6',
-  'Healthcare':    '#14b8a6',
-  'Cons. Staples': '#a78bfa',
-  'Cons. Discret.':'#ec4899',
-  'Industrials':   '#84cc16',
-  'Comm. Services':'#f43f5e',
-  'Materials':     '#94a3b8',
-};
-function sectCol(s){return SECT_COL[s]||'#60b8ff';}
-function rsiColor(v){
-  if(v<30)  return '#34d97b';
-  if(v<45)  return '#86efac';
-  if(v<=55) return '#e8f2ff';
-  if(v<=70) return '#fbbf24';
-  return '#f87171';
-}
-
-function buildSectorRsi(rows,eid){
-  var seen={};
-  rows.forEach(function(r){
-    if(r.sector&&r.sector!=='\u2014'&&!(r.sector in seen)&&r.srsi!==''){
-      seen[r.sector]=r.srsi;
-    }
-  });
-  var entries=Object.entries(seen).sort(function(a,b){return a[1]-b[1];});
-  if(!entries.length)return;
-  var tiles=entries.map(function(e){
-    var s=e[0],v=e[1];
-    var sc=sectCol(s);
-    var rc=rsiColor(v);
-    var act=S.sect===s?' active':'';
-    return '<div class="srp-tile'+act+'" onclick="toggleSect(\''+s+'\')" style="border-left-color:'+sc+'">'
-      +'<span class="srp-sname" style="color:'+sc+'">'+s+'</span>'
-      +'<span class="srp-val" style="color:'+rc+'">'+v+'</span>'
-      +'</div>';
-  }).join('');
-  var el=document.getElementById('srp-'+eid);
-  if(el)el.innerHTML='<div class="srp-title">&#128200; Sector RSI &mdash; click a tile to filter</div>'
-    +'<div class="srp-tiles">'+tiles+'</div>';
+function fmtP(p,exch){
+  var s=exch==='NSE'?'\u20b9':'$';
+  return s+parseFloat(p).toLocaleString('en-IN',{minimumFractionDigits:2,maximumFractionDigits:2});
 }
 
 function populateSectors(){
-  var rows=DATA[S.exch]||[];
+  var sel=document.getElementById('sect-sel');
+  var cur=sel.value;
+  var data=ALL_DATA.filter(function(r){return S.exch==='ALL'||r.exchange===S.exch;});
   var seen={};var sects=[];
-  rows.forEach(function(r){
-    if(r.sector&&r.sector!=='\u2014'&&!seen[r.sector]){seen[r.sector]=1;sects.push(r.sector);}
-  });
+  data.forEach(function(r){if(r.sector&&r.sector!=='\u2014'&&!seen[r.sector]){seen[r.sector]=1;sects.push(r.sector);}});
   sects.sort();
-  var sel=document.getElementById('sect-select');
-  if(!sel)return;
-  sel.innerHTML='<option value="">All sectors</option>';
-  sects.forEach(function(s){
-    var o=document.createElement('option');
-    o.value=s;o.textContent=s;
-    if(S.sect===s)o.selected=true;
-    sel.appendChild(o);
+  while(sel.options.length>1)sel.remove(1);
+  sects.forEach(function(s){var o=document.createElement('option');o.value=s;o.textContent=s;if(s===cur)o.selected=true;sel.appendChild(o);});
+}
+
+function render(){
+  var q=document.getElementById('searchbox').value.trim().toLowerCase();
+  var sectF=document.getElementById('sect-sel').value;
+  var rsiF=document.getElementById('rsi-sel').value;
+  var volOnly=document.getElementById('vol-chk').checked;
+  var topVol=parseInt(document.getElementById('topvol-sel').value||'0',10);
+
+  var data=ALL_DATA.filter(function(r){
+    if(S.exch!=='ALL'&&r.exchange!==S.exch)return false;
+    if(S.dir==='bull'&&r.signal!=='BULLISH')return false;
+    if(S.dir==='bear'&&r.signal!=='BEARISH')return false;
+    if(sectF&&r.sector!==sectF)return false;
+    if(rsiF&&rsiZone(r.rsi)!==rsiF)return false;
+    if(volOnly&&!r.vol_ok)return false;
+    if(q&&r.ticker.toLowerCase().indexOf(q)<0&&r.name.toLowerCase().indexOf(q)<0)return false;
+    return true;
   });
-}
 
-function renderCards(eid){
-  var rows=DATA[eid]||[];
-  var stocks=groupByTicker(rows);
-  var grid=document.getElementById('grid-'+eid);
-  if(!grid)return;
-  if(!stocks.length){
-    grid.innerHTML='<div class="empty">No signals match current filters.</div>';
-  } else {
-    grid.innerHTML=stocks.map(buildCard).join('');
+  // Top-N by volume ratio
+  if(topVol>0){
+    var sorted=[].concat(data).sort(function(a,b){return parseFloat(b.vol_ratio)-parseFloat(a.vol_ratio);});
+    var topTickers={};
+    sorted.slice(0,topVol).forEach(function(r){topTickers[r.ticker]=1;});
+    data=data.filter(function(r){return topTickers[r.ticker];});
   }
-  var sigTotal=stocks.reduce(function(n,s){return n+s.sigs.length;},0);
-  var rc=document.getElementById('result-count');
-  if(eid===S.exch&&rc)rc.textContent=stocks.length+' tickers \u00b7 '+sigTotal+' signals';
-}
 
-function buildLegend(eid){
-  var rows=DATA[eid]||[];
-  var cnt={};
-  rows.forEach(function(r){cnt[r.num]=(cnt[r.num]||0)+1;});
-  var parts=[];
-  for(var i=1;i<=20;i++){
-    var n=String(i);
-    var hit=cnt[n]?'<span class="lhit">'+cnt[n]+'</span>':'';
-    parts.push('<div class="lgi"><span class="ln">'+n+'</span>'
-      +'<span style="color:var(--txt)">'+TL_CAT[n]+'</span>'+hit+'</div>');
+  if(S.sortCol){
+    var col=S.sortCol,asc=S.sortAsc;
+    data.sort(function(a,b){
+      var va=a[col],vb=b[col];
+      if(va===undefined||va===null)va='';
+      if(vb===undefined||vb===null)vb='';
+      if(typeof va==='string')va=va.toLowerCase(),vb=vb.toLowerCase();
+      return asc?(va>vb?1:va<vb?-1:0):(va<vb?1:va>vb?-1:0);
+    });
   }
-  var el=document.getElementById('lgnd-'+eid);
-  if(el)el.innerHTML=parts.join('');
-}
 
-function updateStats(){
-  var rows=DATA[S.exch]||[];
-  if(S.sect)rows=rows.filter(function(r){return r.sector===S.sect;});
-  var shown=S.dir==='all'?rows:rows.filter(function(r){
-    return r.signal===(S.dir==='bull'?'BULLISH':'BEARISH');
+  document.getElementById('rc-txt').textContent=data.length+' signal'+(data.length!==1?'s':'');
+  document.getElementById('stat-total').textContent=ALL_DATA.length;
+  document.getElementById('stat-bull').textContent=ALL_DATA.filter(function(r){return r.signal==='BULLISH';}).length;
+  document.getElementById('stat-bear').textContent=ALL_DATA.filter(function(r){return r.signal==='BEARISH';}).length;
+  document.getElementById('stat-vol').textContent=ALL_DATA.filter(function(r){return r.vol_ok;}).length;
+
+  var tbody=document.getElementById('tbl-body');
+  if(!data.length){
+    tbody.innerHTML='<tr class="empty-row"><td colspan="13">No signals match the current filters.</td></tr>';
+    return;
+  }
+
+  var html='';
+  data.forEach(function(r){
+    var isBull=r.signal==='BULLISH';
+    var rsiV=r.rsi!==''?parseFloat(r.rsi).toFixed(1):'—';
+    var rsiZ=r.rsi!==''?rsiZone(r.rsi):'';
+    var srsiV=r.srsi!==''?parseFloat(r.srsi).toFixed(1):'—';
+    var srsiZ=r.srsi!==''?rsiZone(r.srsi):'';
+    var chgCls=parseFloat(r.change)>=0?'up':'dn';
+    var chgSign=parseFloat(r.change)>=0?'+':'';
+    var volOk=r.vol_ok;
+    var exchCls=r.exchange==='NSE'?'exch-nse':'exch-nyse';
+    var exchFlag=r.exchange==='NSE'?'&#127470;&#127475;':'&#127482;&#127480;';
+    var sectCls=sectZoneCls(r.sector);
+    html+='<tr>'
+      +'<td class="ct">'+r.ticker+'</td>'
+      +'<td class="cn" title="'+r.name+'">'+r.name+'</td>'
+      +'<td class="cs"><span class="'+sectCls+'">'+r.sector+'</span></td>'
+      +'<td><span class="exch-badge '+exchCls+'">'+exchFlag+' '+r.exchange+'</span></td>'
+      +'<td class="cp">'+fmtP(r.price,r.exchange)+'</td>'
+      +'<td class="cc '+chgCls+'">'+chgSign+parseFloat(r.change).toFixed(2)+'%</td>'
+      +'<td><span class="sig-badge '+(isBull?'bull':'bear')+'">'+(isBull?'\u25b2':'\u25bc')+' '+r.signal+'</span></td>'
+      +'<td class="crsi"><span class="rv '+rsiCls(rsiZ)+'">'+rsiV+'</span>'+(rsiZ?'<span class="rz '+rsiCls(rsiZ)+'">'+rsiZ+'</span>':'')+'</td>'
+      +'<td class="crsi"><span class="rv '+rsiCls(srsiZ)+'">'+srsiV+'</span>'+(srsiZ?'<span class="rz '+rsiCls(srsiZ)+'">'+srsiZ+'</span>':'')+'</td>'
+      +'<td class="cvol">'+(volOk?'<span class="vok">':'')
+        +parseFloat(r.vol_ratio).toFixed(1)+'x'+(volOk?'<b>&nbsp;&#10003;</b></span>':'')
+      +'</td>'
+      +'<td class="ctln"><span class="tnum">#'+r.num+'</span><span class="tname">'+(TL_NAMES[r.num]||'')+'</span></td>'
+      +'<td class="cdet"><span class="dtxt" title="'+r.type+' \u2014 '+r.detail+'">'+r.type+' \u2014 '+r.detail+'</span></td>'
+      +'<td class="clvl">'+fmtP(r.tl,r.exchange)+'</td>'
+      +'</tr>';
   });
-  var b=shown.filter(function(r){return r.signal==='BULLISH';}).length;
-  var r=shown.filter(function(r){return r.signal==='BEARISH';}).length;
-  var v=shown.filter(function(r){return r.vol_ok;}).length;
-  var el;
-  if(el=document.getElementById('stat-total'))el.textContent=shown.length;
-  if(el=document.getElementById('stat-bull')) el.textContent=b;
-  if(el=document.getElementById('stat-bear')) el.textContent=r;
-  if(el=document.getElementById('stat-vol'))  el.textContent=v;
+  tbody.innerHTML=html;
 }
 
-function switchExch(ex){
-  S.exch=ex;S.sect='';
-  document.getElementById('panel-nse').classList.toggle('active',ex==='nse');
-  document.getElementById('panel-nyse').classList.toggle('active',ex==='nyse');
-  document.getElementById('srp-nse').style.display=ex==='nse'?'':'none';
-  document.getElementById('srp-nyse').style.display=ex==='nyse'?'':'none';
-  var bns=document.getElementById('btn-nse');
-  var bny=document.getElementById('btn-nyse');
-  if(bns)bns.className='btn'+(ex==='nse'?' on':'');
-  if(bny)bny.className='btn'+(ex==='nyse'?' on':'');
-  var ss=document.getElementById('sect-select');
-  if(ss)ss.value='';
+function applyTimeframe(tf){
+  var labels={'15m':'15 Min','1h':'1 Hour','4h':'4 Hour','1d':'1 Day'};
+  var badge=document.getElementById('tf-badge');
+  if(badge)badge.textContent='\u23f1 '+( labels[tf]||tf);
+  // Show re-run notice banner
+  var existing=document.getElementById('tf-notice');
+  if(existing)existing.remove();
+  var bar=document.createElement('div');
+  bar.id='tf-notice';
+  bar.style.cssText='background:#1a1e27;border-bottom:1px solid rgba(245,200,66,0.4);padding:8px 20px;font-size:11px;font-family:var(--mono);color:#f5c842;display:flex;align-items:center;gap:10px;';
+  bar.innerHTML='&#9888;&nbsp;<b>Timeframe changed to '+(labels[tf]||tf)+'</b> &mdash; '
+    +'Re-run the scanner with: &nbsp;<code style="background:rgba(255,255,255,0.08);padding:2px 7px;border-radius:3px;">python trendline_scanner.py --timeframe '+tf+'</code>'
+    +'&nbsp;<button onclick="this.parentNode.remove()" style="margin-left:auto;background:transparent;border:1px solid rgba(245,200,66,0.4);color:#f5c842;padding:2px 10px;border-radius:4px;cursor:pointer;font-size:10px;font-family:var(--mono)">&#10005; Dismiss</button>';
+  var toolbar=document.querySelector('.toolbar');
+  toolbar.parentNode.insertBefore(bar,toolbar.nextSibling);
+}
+
+function setExch(ex){
+  S.exch=ex;
+  var btns=document.querySelectorAll('#exch-btns .bg-btn');
+  btns.forEach(function(b){b.classList.remove('active');});
+  var map={ALL:0,NSE:1,NYSE:2};
+  if(map[ex]!==undefined)btns[map[ex]].classList.add('active');
+  document.getElementById('sect-sel').value='';
   populateSectors();
-  renderCards(ex);
-  updateStats();
+  syncSrsiToExch(ex);
+  render();
 }
 
 function setDir(d){
   S.dir=d;
-  ['all','bull','bear'].forEach(function(x){
-    var b=document.getElementById('btn-'+x);
-    if(!b)return;
-    if(x===d){
-      b.className='btn'+(x==='bull'?' bull-on':x==='bear'?' bear-on':' on');
-    } else {
-      b.className='btn';
-    }
+  var btns=document.querySelectorAll('#dir-btns .bg-btn');
+  btns.forEach(function(b){b.classList.remove('active','bull-on','bear-on');});
+  var map={all:0,bull:1,bear:2};
+  var btn=btns[map[d]];
+  if(d==='bull')btn.classList.add('bull-on');
+  else if(d==='bear')btn.classList.add('bear-on');
+  else btn.classList.add('active');
+  render();
+}
+
+function sortBy(col){
+  if(S.sortCol===col)S.sortAsc=!S.sortAsc;
+  else{S.sortCol=col;S.sortAsc=true;}
+  document.querySelectorAll('thead th').forEach(function(th){
+    th.classList.remove('sorted');
+    var sa=th.querySelector('.sa');if(sa)sa.innerHTML='&#8597;';
   });
-  renderCards(S.exch);
-  updateStats();
+  var cols=['ticker','name','sector','exchange','price','change','signal','rsi','srsi','vol_ratio','num','','tl'];
+  var idx=cols.indexOf(col);
+  if(idx>=0){
+    var th=document.querySelectorAll('thead th')[idx];
+    th.classList.add('sorted');
+    var sa=th.querySelector('.sa');
+    if(sa)sa.innerHTML=S.sortAsc?'&#8593;':'&#8595;';
+  }
+  render();
 }
 
-function setSect(s){
-  S.sect=s;
-  document.querySelectorAll('.srp-tile').forEach(function(t){
-    var nm=t.querySelector('.srp-sname');
-    if(nm)t.classList.toggle('active',nm.textContent===s);
-  });
-  renderCards(S.exch);
-  updateStats();
+function toggleLgnd(){
+  var p=document.getElementById('lgnd-panel');
+  var b=document.querySelector('.lgnd-toggle');
+  p.classList.toggle('open');
+  b.textContent=p.classList.contains('open')?'\u25be TL Types (20)':'\u25b6 TL Types (20)';
 }
-
-function toggleSect(s){
-  S.sect=(S.sect===s?'':s);
-  var ss=document.getElementById('sect-select');
-  if(ss)ss.value=S.sect;
-  setSect(S.sect);
-}
-
-document.addEventListener('DOMContentLoaded',function(){
-  DATA.nse=loadData('nse');
-  DATA.nyse=loadData('nyse');
-  buildSectorRsi(DATA.nse,'nse');
-  buildSectorRsi(DATA.nyse,'nyse');
-  populateSectors();
-  renderCards('nse');
-  renderCards('nyse');
-  buildLegend('nse');
-  buildLegend('nyse');
-  updateStats();
-});
 
 function isDST(d){
   var j=new Date(d.getFullYear(),0,1).getTimezoneOffset();
@@ -1713,11 +2333,333 @@ function updateClock(){
 }
 setInterval(updateClock,1000);
 updateClock();
+
+populateSectors();
+renderSrsiPanel('NSE');
+render();
+
+/* ── VOLUME SPIKE TAB ──────────────────────────────────────────────── */
+var VS_DATA = (function(){
+  var el = document.getElementById('data-vol-spikes');
+  if(!el) return [];
+  try{ return JSON.parse(el.textContent); }catch(e){ return []; }
+})();
+
+var VS = { exch:'ALL', dir:'ALL', sortCol:'vol_ratio', sortAsc:false };
+
+function fmtVol(v){
+  if(v>=1e7) return (v/1e7).toFixed(1)+'Cr';
+  if(v>=1e5) return (v/1e5).toFixed(1)+'L';
+  if(v>=1000) return (v/1000).toFixed(0)+'K';
+  return v;
+}
+
+function switchTab(tab){
+  document.querySelectorAll('.tab-panel').forEach(function(p){ p.classList.remove('active'); });
+  document.querySelectorAll('.main-tab').forEach(function(b){ b.classList.remove('active'); });
+  document.getElementById('tab-'+tab).classList.add('active');
+  document.getElementById('tab-btn-'+tab).classList.add('active');
+}
+
+function setVsExch(ex){
+  VS.exch = ex;
+  ['all','nse','nyse'].forEach(function(e){
+    var btn = document.getElementById('vs-exch-'+e);
+    if(btn) btn.classList.remove('active');
+  });
+  var map = {ALL:'all', NSE:'nse', NYSE:'nyse'};
+  var btn = document.getElementById('vs-exch-'+(map[ex]||'all'));
+  if(btn) btn.classList.add('active');
+  renderVsTab();
+}
+
+function setVsDir(d){
+  VS.dir = d;
+  ['all','up','down'].forEach(function(e){
+    var btn = document.getElementById('vs-dir-'+e);
+    if(btn) btn.classList.remove('active');
+  });
+  var map = {ALL:'all', UP:'up', DOWN:'down'};
+  var btn = document.getElementById('vs-dir-'+(map[d]||'all'));
+  if(btn) btn.classList.add('active');
+  renderVsTab();
+}
+
+function vsSort(col){
+  if(VS.sortCol===col) VS.sortAsc=!VS.sortAsc;
+  else { VS.sortCol=col; VS.sortAsc=(col==='ticker'||col==='name'); }
+  // update header arrows
+  document.querySelectorAll('#vs-tbl thead th').forEach(function(th){ th.classList.remove('sorted'); var sa=th.querySelector('.sa');if(sa)sa.innerHTML='&#8597;'; });
+  var cols=['candle_time','ticker','name','sector','exchange','price','candle_chg','candle_body','candle_range','vol_ratio','cur_vol','avg_vol','has_breakout'];
+  var idx=cols.indexOf(col);
+  if(idx>=0){
+    var th=document.querySelectorAll('#vs-tbl thead th')[idx];
+    if(th){ th.classList.add('sorted'); var sa=th.querySelector('.sa'); if(sa)sa.innerHTML=VS.sortAsc?'&#8593;':'&#8595;'; }
+  }
+  renderVsTab();
+}
+
+function renderVsTab(){
+  var slider = document.getElementById('vs-ratio-slider');
+  var ratioMin = slider ? parseFloat(slider.value) : 1;
+  document.getElementById('vs-ratio-val').textContent = ratioMin.toFixed(1)+'x';
+
+  var sigOnly = document.getElementById('vs-sig-only').checked;
+
+  var data = VS_DATA.filter(function(r){
+    if(VS.exch !== 'ALL' && r.exchange !== VS.exch) return false;
+    if(VS.dir  !== 'ALL' && r.direction !== VS.dir) return false;
+    if(r.vol_ratio < ratioMin) return false;
+    if(sigOnly && !r.has_breakout) return false;
+    return true;
+  });
+
+  // sort
+  data = [].concat(data).sort(function(a,b){
+    var va=a[VS.sortCol], vb=b[VS.sortCol];
+    if(va===undefined||va===null) va='';
+    if(vb===undefined||vb===null) vb='';
+    if(typeof va==='string') va=va.toLowerCase(), vb=vb.toLowerCase();
+    return VS.sortAsc ? (va>vb?1:va<vb?-1:0) : (va<vb?1:va>vb?-1:0);
+  });
+
+  document.getElementById('vs-row-count').textContent = data.length+' stock'+(data.length!==1?'s':'');
+
+  var tbody = document.getElementById('vs-tbl-body');
+  if(!data.length){
+    tbody.innerHTML='<tr><td colspan="13" style="padding:20px;color:var(--dim);font-family:var(--mono);text-align:center">No volume spikes match the current filters.</td></tr>';
+    return;
+  }
+
+  var html='';
+  data.forEach(function(r){
+    var isUp   = r.direction === 'UP';
+    var chgCls = r.candle_chg >= 0 ? 'up' : 'dn';
+    var chgSign= r.candle_chg >= 0 ? '+' : '';
+    var exchCls= r.exchange==='NSE'?'exch-nse':'exch-nyse';
+    var exchFlag=r.exchange==='NSE'?'&#127470;&#127475;':'&#127482;&#127480;';
+    var ratioColor = r.vol_ratio>=5 ? '#ff4c5b' : r.vol_ratio>=3 ? '#f5c842' : r.vol_ratio>=2 ? '#00d17a' : 'var(--mu)';
+    var dirBadge = isUp
+      ? '<span style="color:var(--bull);font-family:var(--mono);font-size:10px;font-weight:700">&#9650; UP</span>'
+      : '<span style="color:var(--bear);font-family:var(--mono);font-size:10px;font-weight:700">&#9660; DOWN</span>';
+    var brkCell = r.has_breakout
+      ? '<span class="vs-signal-tag" title="'+r.breakout_signals.join(', ')+'">&#9889; '+r.breakout_signals.length+' breakout'+(r.breakout_signals.length>1?'s':'')+'</span>'
+      : '<span style="color:var(--dim);font-size:10px;font-family:var(--mono)">—</span>';
+    html += '<tr>'
+      +'<td style="font-family:var(--mono);font-size:11px;color:var(--acc);white-space:nowrap">'+(r.candle_time||'—')+'</td>'
+      +'<td class="ct">'+r.ticker+'</td>'
+      +'<td class="cn" title="'+r.name+'">'+r.name+'</td>'
+      +'<td class="cs"><span class="'+sectZoneCls(r.sector)+'">'+r.sector+'</span></td>'
+      +'<td><span class="exch-badge '+exchCls+'">'+exchFlag+' '+r.exchange+'</span></td>'
+      +'<td class="cp">'+fmtP(r.price, r.exchange)+'</td>'
+      +'<td class="cc '+chgCls+'" style="text-align:right">'+chgSign+r.candle_chg.toFixed(2)+'%</td>'
+      +'<td style="text-align:right;font-family:var(--mono);color:var(--mu)">'+r.candle_body.toFixed(2)+'%</td>'
+      +'<td style="text-align:right;font-family:var(--mono);color:var(--dim)">'+r.candle_range.toFixed(2)+'%</td>'
+      +'<td style="text-align:right;font-family:var(--mono);font-weight:700;font-size:14px;color:'+ratioColor+'">'+r.vol_ratio.toFixed(2)+'x</td>'
+      +'<td style="text-align:right;font-family:var(--mono);color:var(--mu)">'+fmtVol(r.cur_vol)+'</td>'
+      +'<td style="text-align:right;font-family:var(--mono);color:var(--dim)">'+fmtVol(r.avg_vol)+'</td>'
+      +'<td>'+brkCell+'</td>'
+      +'</tr>';
+  });
+  tbody.innerHTML = html;
+}
+
+// ── Build top-12 alert cards ──────────────────────────────────────────────
+function buildAlertCards(){
+  var panel = document.getElementById('vs-alert-panel');
+  var cards = document.getElementById('vs-alert-cards');
+  var countEl = document.getElementById('vs-alert-count');
+  var tabCount = document.getElementById('vs-tab-count');
+  if(!panel||!cards) return;
+
+  var top = VS_DATA.slice(0,12);   // already sorted by vol_ratio desc from Python
+  if(!top.length){ panel.classList.remove('has-data'); return; }
+
+  panel.classList.add('has-data');
+  if(countEl) countEl.textContent = VS_DATA.length+' spike'+(VS_DATA.length!==1?'s':'');
+  if(tabCount) tabCount.textContent = '('+VS_DATA.length+')';
+
+  var html='';
+  top.forEach(function(r){
+    var isUp = r.direction==='UP';
+    var dirCls = isUp ? 'dir-up' : 'dir-down';
+    var sigCls = r.has_breakout ? 'has-signal' : '';
+    var dotCls = r.exchange==='NSE' ? 'nse' : 'nyse';
+    var chgSign = r.candle_chg>=0?'+':'';
+    var chgCls  = r.candle_chg>=0?'up':'down';
+    var ratioColor = r.vol_ratio>=5?'#ff4c5b':r.vol_ratio>=3?'#f5c842':'#00d17a';
+    html += '<div class="vs-card '+dirCls+' '+sigCls+'" onclick="switchTab(&apos;volspike&apos;)" title="'+r.name+' — Vol: '+r.vol_ratio.toFixed(2)+'x avg | Chg: '+r.candle_chg.toFixed(2)+'%">'
+      +'<div style="display:flex;align-items:center;gap:5px">'
+      +'<span class="vs-exch-dot '+dotCls+'"></span>'
+      +'<span class="vs-card-ticker">'+r.ticker+'</span>'
+      +'</div>'
+      +'<div class="vs-card-name">'+r.name+'</div>'
+      +'<div class="vs-card-row">'
+      +'<div><div class="vs-vol-ratio" style="color:'+ratioColor+'">'+r.vol_ratio.toFixed(1)+'x</div>'
+      +'<div class="vs-vol-label">vol ratio</div></div>'
+      +'<div class="vs-chg '+chgCls+'">'+chgSign+r.candle_chg.toFixed(2)+'%</div>'
+      +'</div>'
+      +(r.has_breakout?'<div class="vs-signal-tag">&#9889; breakout</div>':'')
+      +'</div>';
+  });
+  cards.innerHTML = html;
+}
+
+buildAlertCards();
+renderVsTab();
+// mark vol_ratio col header as default sorted
+(function(){
+  var th=document.querySelectorAll('#vs-tbl thead th')[8];
+  if(th){th.classList.add('sorted');var sa=th.querySelector('.sa');if(sa)sa.innerHTML='&#8595;';}
+})();
 </script>
 </body></html>"""
 
 
-def generate_html(results, scan_time):
+
+# ── Collect all sector RSIs for the panel ────────────────────────────────────
+NSE_SECTOR_CODES = [
+    ("^NSEBANK",            "Banking"),
+    ("NIFTY_FIN_SERVICE.NS","Fin. Services"),
+    ("^CNXIT",              "IT"),
+    ("^CNXENERGY",          "Energy"),
+    ("^CNXAUTO",            "Auto"),
+    ("^CNXPHARMA",          "Pharma"),
+    ("^CNXMETAL",           "Metals"),
+    ("^CNXFMCG",            "FMCG"),
+    ("^CNXINFRA",           "Infra/Defence"),
+    ("^CNXCONSUM",          "Cons. Goods"),
+]
+NYSE_SECTOR_CODES = [
+    ("XLK",  "Technology"),
+    ("XLF",  "Financials"),
+    ("XLV",  "Healthcare"),
+    ("XLP",  "Cons. Staples"),
+    ("XLY",  "Cons. Discret."),
+    ("XLE",  "Energy"),
+    ("XLI",  "Industrials"),
+    ("XLC",  "Comm. Services"),
+    ("XLB",  "Materials"),
+]
+
+def collect_sector_rsi_panel():
+    """
+    Fetch daily RSI for every NSE and NYSE sector index.
+    Always uses 1d/6mo regardless of the active scan timeframe,
+    so the sector health panel is always on the daily chart.
+    Returns two lists of dicts: nse_panel, nyse_panel.
+    """
+    def _fetch_rsi_daily(code):
+        if YF_AVAILABLE:
+            df = fetch_yf(code, period="6mo", interval="1d")
+            if df is not None and len(df) >= 15:
+                return calc_rsi(df)
+        return get_sector_rsi(code)   # synthetic fallback
+
+    nse_panel, nyse_panel = [], []
+
+    for code, label in NSE_SECTOR_CODES:
+        rsi_val = _fetch_rsi_daily(code)
+        zone, _ = rsi_zone(rsi_val)
+        nse_panel.append({"code": code, "label": label,
+                          "rsi": round(rsi_val, 1) if rsi_val is not None else None,
+                          "zone": zone})
+
+    for code, label in NYSE_SECTOR_CODES:
+        rsi_val = _fetch_rsi_daily(code)
+        zone, _ = rsi_zone(rsi_val)
+        nyse_panel.append({"code": code, "label": label,
+                           "rsi": round(rsi_val, 1) if rsi_val is not None else None,
+                           "zone": zone})
+
+    return nse_panel, nyse_panel
+
+
+# ── Volume Spike Detector ─────────────────────────────────────────────────────
+def detect_volume_spikes(all_stocks_data):
+    """
+    For every stock in all_stocks_data (list of (ticker,name,price,idx,exchange)),
+    fetch OHLCV using ACTIVE_TIMEFRAME and compute volume spike metrics on the
+    latest candle. Returns list of dicts sorted by vol_ratio descending.
+    all_stocks_data: list of (ticker, name, base_price, idx, exchange, live)
+    """
+    spikes = []
+    for (ticker, name, base_price, idx, exchange, live) in all_stocks_data:
+        try:
+            df = fetch_data(ticker, base_price, idx, exchange=exchange, live=live)
+            if df is None or len(df) < 5:
+                continue
+
+            cur_candle  = df.iloc[-1]
+            prev_close  = float(df["Close"].iloc[-2])
+            cur_close   = float(cur_candle["Close"])
+            cur_open    = float(cur_candle["Open"])
+            cur_high    = float(cur_candle["High"])
+            cur_low     = float(cur_candle["Low"])
+            cur_vol     = float(cur_candle["Volume"])
+
+            # Capture the candle's own timestamp (date + time of bar open)
+            # _ts column holds IST-converted timestamps preserved in fetch_yf
+            try:
+                import pandas as _pd
+                if "_ts" in df.columns and df["_ts"].iloc[-1] is not None:
+                    ts_ist = _pd.Timestamp(df["_ts"].iloc[-1])
+                    # For daily timeframe, yfinance gives date-only (midnight) — show date only
+                    if ACTIVE_TIMEFRAME == "1d":
+                        candle_time_str = ts_ist.strftime("%d %b %Y")
+                    else:
+                        candle_time_str = ts_ist.strftime("%d %b %Y  %H:%M IST")
+                else:
+                    # Fallback: use stripped index, treat as UTC for intraday
+                    raw_ts = df.index[-1]
+                    ts = _pd.Timestamp(raw_ts)
+                    if ACTIVE_TIMEFRAME == "1d":
+                        candle_time_str = ts.strftime("%d %b %Y")
+                    else:
+                        ts_ist = ts.tz_localize("UTC").tz_convert("Asia/Kolkata")
+                        candle_time_str = ts_ist.strftime("%d %b %Y  %H:%M IST")
+            except Exception:
+                candle_time_str = str(df.index[-1])[:16]
+
+            # Average volume over last 20 candles (excluding current)
+            avg_vol = float(df["Volume"].iloc[-21:-1].mean()) if len(df) >= 21 else float(df["Volume"].iloc[:-1].mean())
+            if avg_vol <= 0:
+                continue
+
+            vol_ratio   = round(cur_vol / avg_vol, 2)
+            candle_chg  = round((cur_close - prev_close) / prev_close * 100, 2) if prev_close else 0
+            candle_body = round(abs(cur_close - cur_open) / prev_close * 100, 2) if prev_close else 0
+            candle_range= round((cur_high - cur_low) / prev_close * 100, 2) if prev_close else 0
+            direction   = "UP" if cur_close >= cur_open else "DOWN"
+
+            # Check if this ticker has any trendline breakout signal in all_results
+            tl_signals  = []  # will be filled in generate_html
+
+            spikes.append({
+                "ticker":       ticker,
+                "name":         name,
+                "exchange":     exchange,
+                "sector":       get_sector(ticker, exchange),
+                "price":        round(cur_close, 2),
+                "candle_chg":   candle_chg,
+                "candle_body":  candle_body,
+                "candle_range": candle_range,
+                "direction":    direction,
+                "cur_vol":      int(cur_vol),
+                "avg_vol":      int(avg_vol),
+                "vol_ratio":    vol_ratio,
+                "candle_time":  candle_time_str,   # date+time of the spike candle
+                "has_breakout": False,   # patched in generate_html
+                "breakout_signals": [],  # patched in generate_html
+            })
+        except Exception as e:
+            logging.debug(f"[{ticker}] vol spike calc failed: {e}")
+
+    spikes.sort(key=lambda x: x["vol_ratio"], reverse=True)
+    return spikes
+
+
+def generate_html(results, scan_time, tf_label="1 Day", vol_spikes=None):
     import json as _json
 
     bull  = [r for r in results if r["signal"] == "BULLISH"]
@@ -1754,55 +2696,331 @@ def generate_html(results, scan_time):
     nse_json  = _json.dumps([row_to_dict(r) for r in nse],  ensure_ascii=False)
     nyse_json = _json.dumps([row_to_dict(r) for r in nyse], ensure_ascii=False)
 
+    # ── Volume Spike tab data ──────────────────────────────────────────────────
+    if vol_spikes is None:
+        vol_spikes = []
+    # Patch breakout signals: match by ticker
+    breakout_map = {}
+    for r in results:
+        t = r["ticker"]
+        if t not in breakout_map:
+            breakout_map[t] = []
+        breakout_map[t].append(r["type"] + " (" + r["signal"] + ")")
+    for s in vol_spikes:
+        sigs = breakout_map.get(s["ticker"], [])
+        s["has_breakout"]       = len(sigs) > 0
+        s["breakout_signals"]   = sigs[:3]   # max 3 labels in panel
+    vol_spike_json = _json.dumps(vol_spikes, ensure_ascii=False)
+
+    # Sector RSI panel data (always daily)
+    nse_panel, nyse_panel = collect_sector_rsi_panel()
+    nse_srsi_json  = _json.dumps(nse_panel,  ensure_ascii=False)
+    nyse_srsi_json = _json.dumps(nyse_panel, ensure_ascii=False)
+
     html = _HTML_TEMPLATE
-    html = html.replace("%%SCAN_TIME%%",  scan_time)
-    html = html.replace("%%NSE_DATA%%",   nse_json)
-    html = html.replace("%%NYSE_DATA%%",  nyse_json)
-    html = html.replace("%%TOTAL%%",      str(len(results)))
-    html = html.replace("%%BULL%%",       str(len(bull)))
-    html = html.replace("%%BEAR%%",       str(len(bear)))
-    html = html.replace("%%NSE%%",        str(len(nse)))
-    html = html.replace("%%NYSE%%",       str(len(nyse)))
-    html = html.replace("%%VOL%%",        str(len(vol_c)))
-    html = html.replace("%%SCANNED%%",    str(len(NSE_STOCKS) + len(NYSE_STOCKS)))
+    html = html.replace("%%SCAN_TIME%%",     scan_time)
+    html = html.replace("%%TF_LABEL%%",      tf_label)
+    # Mark the selected option in the timeframe dropdown
+    tf_key = ACTIVE_TIMEFRAME
+    for k in ["1d","4h","1h","15m"]:
+        placeholder = f"%%TF_SEL_{k.upper().replace('M','M')}%%"
+        html = html.replace(placeholder, 'selected' if k == tf_key else '')
+    html = html.replace("%%NSE_DATA%%",      nse_json)
+    html = html.replace("%%NYSE_DATA%%",     nyse_json)
+    html = html.replace("%%VOL_SPIKE_DATA%%", vol_spike_json)
+    html = html.replace("%%NSE_SRSI%%",      nse_srsi_json)
+    html = html.replace("%%NYSE_SRSI%%",     nyse_srsi_json)
+    html = html.replace("%%TOTAL%%",         str(len(results)))
+    html = html.replace("%%BULL%%",          str(len(bull)))
+    html = html.replace("%%BEAR%%",          str(len(bear)))
+    html = html.replace("%%NSE%%",           str(len(nse)))
+    html = html.replace("%%NYSE%%",          str(len(nyse)))
+    html = html.replace("%%VOL%%",           str(len(vol_c)))
+    html = html.replace("%%SCANNED%%",       str(len(NSE_STOCKS) + len(NYSE_STOCKS)))
     return html
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-def main():
-    scan_time = datetime.now().strftime("%d %b %Y  %H:%M:%S")
-    total_stocks = len(NSE_STOCKS) + len(NYSE_STOCKS)
-    print(f"\nTrendBreak Pro v2  ·  {total_stocks} stocks  ·  20 trendline types  ·  {scan_time}")
-    print(f"  13 fixes applied — see file header for changelog\n")
+# ── Market Hours (FIX-14 / FIX-15) ───────────────────────────────────────────
+def market_status() -> tuple[bool, bool]:
+    """
+    Returns (nse_open, nyse_open).
+      NSE  : Mon–Fri  09:15–15:30  IST  (Asia/Kolkata)
+      NYSE : Mon–Fri  09:30–16:00  ET   (America/New_York, DST-aware)
+    Note: public holidays are NOT checked — only clock & weekday.
+    """
+    now_ist = datetime.now(ZoneInfo("Asia/Kolkata"))
+    now_et  = datetime.now(ZoneInfo("America/New_York"))
+
+    def _in_session(now, open_hm, close_hm):
+        if now.weekday() >= 5:          # Saturday=5, Sunday=6
+            return False
+        t = (now.hour, now.minute)
+        return open_hm <= t <= close_hm
+
+    nse_open  = _in_session(now_ist, (9, 15),  (15, 30))   # 09:15–15:30 IST
+    nyse_open = _in_session(now_et,  (9,  0),  (19,  0))   # 09:00–19:00 ET
+    return nse_open, nyse_open
+
+
+# ── Report Freshness Check (FIX-16) ───────────────────────────────────────────
+# How many minutes a report stays "fresh" for each timeframe
+_FRESH_MINUTES = {"15m": 15, "1h": 60, "4h": 240, "1d": 1440}
+
+def report_is_fresh(out_path: str, timeframe: str) -> bool:
+    """Return True if the existing report is younger than one candle period."""
+    if not os.path.exists(out_path):
+        return False
+    age_min = (time.time() - os.path.getmtime(out_path)) / 60
+    return age_min < _FRESH_MINUTES.get(timeframe, 0)
+
+
+# ── Single-timeframe scan (shared by main() and multi-TF loop) ───────────────
+def run_single_timeframe(tf, nse_to_scan, nyse_to_scan, scan_time, force=False):
+    """
+    Run a full scan for one timeframe (tf = '15m'|'1h'|'4h'|'1d').
+    Returns (all_results, vol_spikes, out_path, tf_label).
+    Clears caches before running so each TF gets fresh yfinance data.
+    """
+    global ACTIVE_TIMEFRAME, _yf_cache, _sector_rsi_cache
+    ACTIVE_TIMEFRAME = tf
+    _yf_cache.clear()
+    _sector_rsi_cache.clear()
+
+    tf_label    = TIMEFRAME_CONFIG[tf][3]
+    total_stocks = len(nse_to_scan) + len(nyse_to_scan)
+    out_path    = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               f"trendline_breakout_{tf}_report.html")
+
+    print(f"\n  ── Timeframe: {tf_label} ({'--force' if force else 'normal'}) ─────────────────")
 
     all_results = []
     done = 0
 
-    for idx, (ticker, name, price) in enumerate(NSE_STOCKS):
-        res = scan_stock(ticker, name, price, idx, "NSE")
+    for idx, (ticker, name, price) in enumerate(nse_to_scan):
+        res = scan_stock(ticker, name, price, idx, "NSE", live=True)
         all_results.extend(res)
         done += 1
-        pct = int(done / total_stocks * 40)
-        print(f"\r  Scanning [{'█'*pct}{'.'*(40-pct)}] {done}/{total_stocks}", end="", flush=True)
+        pct = int(done / max(total_stocks, 1) * 40)
+        print(f"\r    [{tf_label}] Scanning [{'█'*pct}{'.'*(40-pct)}] {done}/{total_stocks}", end="", flush=True)
 
-    for idx, (ticker, name, price) in enumerate(NYSE_STOCKS):
-        res = scan_stock(ticker, name, price, idx, "NYSE")
+    for idx, (ticker, name, price) in enumerate(nyse_to_scan):
+        res = scan_stock(ticker, name, price, idx, "NYSE", live=True)
         all_results.extend(res)
         done += 1
-        pct = int(done / total_stocks * 40)
-        print(f"\r  Scanning [{'█'*pct}{'.'*(40-pct)}] {done}/{total_stocks}", end="", flush=True)
+        pct = int(done / max(total_stocks, 1) * 40)
+        print(f"\r    [{tf_label}] Scanning [{'█'*pct}{'.'*(40-pct)}] {done}/{total_stocks}", end="", flush=True)
 
     bull = [r for r in all_results if r["signal"] == "BULLISH"]
     bear = [r for r in all_results if r["signal"] == "BEARISH"]
+    print(f"\r    [{tf_label}] Scanning [{'█'*40}] {total_stocks}/{total_stocks}  ✅ Done")
+    print(f"    Signals: {len(all_results)} total  |  🟢 {len(bull)} Bullish  |  🔴 {len(bear)} Bearish")
 
-    print(f"\r  Scanning [{'█'*40}] {total_stocks}/{total_stocks}  ✅ Done")
-    print(f"  Signals: {len(all_results)} total  |  🟢 {len(bull)} Bullish  |  🔴 {len(bear)} Bearish")
+    # Volume spikes
+    print(f"    Building volume spike tracker…", end="", flush=True)
+    all_stocks_live = (
+        [(t, n, p, i, "NSE",  True) for i,(t,n,p) in enumerate(nse_to_scan)] +
+        [(t, n, p, i, "NYSE", True) for i,(t,n,p) in enumerate(nyse_to_scan)]
+    )
+    vol_spikes = detect_volume_spikes(all_stocks_live)
+    print(f" {len(vol_spikes)} stocks tracked")
 
-    html = generate_html(all_results, scan_time)
-    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trendline_breakout_report.html")
-    with open(out, "w", encoding="utf-8") as f:
+    html = generate_html(all_results, scan_time, tf_label, vol_spikes=vol_spikes)
+    with open(out_path, "w", encoding="utf-8") as f:
         f.write(html)
-    print(f"  Report  → {out}\n")
+    print(f"    Report  → {out_path}")
+
+    return all_results, vol_spikes, out_path, tf_label
+
+
+# ── Multi-timeframe combined HTML index page ──────────────────────────────────
+def generate_combined_index(tf_reports, scan_time):
+    """
+    Generate a simple HTML index page that links to each individual TF report
+    and shows a quick summary table.
+    tf_reports: list of (tf, tf_label, out_path, n_bull, n_bear, n_vol, n_total)
+    """
+    rows = ""
+    for (tf, tf_label, out_path, n_bull, n_bear, n_vol, n_total) in tf_reports:
+        fname = os.path.basename(out_path)
+        rows += f"""
+        <tr>
+          <td style="font-family:var(--mono);color:var(--gold);font-weight:700">{tf_label}</td>
+          <td style="font-family:var(--mono);color:var(--acc)">{n_total}</td>
+          <td style="font-family:var(--mono);color:#00d17a">▲ {n_bull}</td>
+          <td style="font-family:var(--mono);color:#ff4c5b">▼ {n_bear}</td>
+          <td style="font-family:var(--mono);color:#00d17a">{n_vol} ✓</td>
+          <td><a href="{fname}" style="color:var(--acc);font-family:var(--mono);font-size:11px"
+              target="_blank">Open {tf_label} Report →</a></td>
+        </tr>"""
+
+    return f"""<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>TrendBreak Pro · All Timeframes</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root{{--bg:#0d0f14;--surf:#13161d;--surf2:#1a1e27;--bdr:rgba(255,255,255,0.07);
+  --bdr2:rgba(255,255,255,0.13);--txt:#e8eaf0;--mu:#8b909e;--dim:#555b6a;
+  --acc:#4c9fff;--gold:#f5c842;--mono:'IBM Plex Mono',monospace;--sans:'IBM Plex Sans',sans-serif}}
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{background:var(--bg);color:var(--txt);font-family:var(--sans);min-height:100vh;padding:40px 24px}}
+h1{{font-family:var(--mono);font-size:22px;color:#fff;margin-bottom:4px}}
+.sub{{font-family:var(--mono);font-size:11px;color:var(--dim);margin-bottom:32px}}
+.card{{background:var(--surf);border:1px solid var(--bdr2);border-radius:10px;overflow:hidden;max-width:780px}}
+.card-hdr{{padding:14px 20px;border-bottom:1px solid var(--bdr2);display:flex;align-items:center;gap:10px}}
+.card-title{{font-family:var(--mono);font-size:12px;font-weight:600;color:var(--mu);
+  text-transform:uppercase;letter-spacing:.08em}}
+table{{width:100%;border-collapse:collapse}}
+thead th{{text-align:left;padding:9px 16px;color:var(--dim);font-family:var(--mono);
+  font-size:10px;font-weight:500;text-transform:uppercase;letter-spacing:.07em;
+  border-bottom:1px solid var(--bdr2)}}
+tbody tr{{border-bottom:1px solid var(--bdr);transition:background .1s}}
+tbody tr:hover{{background:var(--surf2)}}
+tbody td{{padding:12px 16px;vertical-align:middle}}
+.tf-links{{display:flex;flex-wrap:wrap;gap:10px;margin-top:24px;max-width:780px}}
+.tf-btn{{display:inline-flex;align-items:center;gap:6px;padding:10px 20px;
+  border-radius:8px;text-decoration:none;font-family:var(--mono);font-size:12px;
+  font-weight:600;border:1px solid var(--bdr2);background:var(--surf);
+  color:var(--acc);transition:.15s}}
+.tf-btn:hover{{border-color:var(--acc);background:rgba(76,159,255,0.08)}}
+footer{{margin-top:32px;font-family:var(--mono);font-size:10px;color:var(--dim)}}
+</style></head><body>
+<h1>⚡ TrendBreak Pro — All Timeframes</h1>
+<div class="sub">Scanned: {scan_time} &nbsp;·&nbsp; 20 trendline types &nbsp;·&nbsp; NSE + NYSE</div>
+
+<div class="card">
+  <div class="card-hdr"><span class="card-title">📊 Summary by Timeframe</span></div>
+  <table>
+    <thead><tr>
+      <th>Timeframe</th><th>Total Signals</th><th>Bullish</th><th>Bearish</th>
+      <th>Vol Confirmed</th><th>Report</th>
+    </tr></thead>
+    <tbody>{rows}</tbody>
+  </table>
+</div>
+
+<div class="tf-links">
+  {''.join(f'<a class="tf-btn" href="{os.path.basename(p)}" target="_blank">⏱ {lbl}</a>'
+           for (_, lbl, p, *_) in tf_reports)}
+</div>
+
+<footer>
+  ⚠ Educational &amp; research purposes only · Not financial advice<br>
+  Generated: {scan_time}
+</footer>
+</body></html>"""
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main():
+    import argparse, os as _os
+    global ACTIVE_TIMEFRAME, _yf_cache, _sector_rsi_cache
+
+    ALL_TF = ["15m", "1h", "4h", "1d"]
+
+    parser = argparse.ArgumentParser(description="TrendBreak Pro — Trendline Breakout Scanner")
+    parser.add_argument(
+        "--timeframe", "-tf",
+        choices=["15m", "1h", "4h", "1d", "all"],
+        default=_os.environ.get("SCAN_TIMEFRAME", "1d"),
+        help=(
+            "Candle timeframe: 15m | 1h | 4h | 1d | all\n"
+            "  all → runs all 4 timeframes in one go, generates one report per TF\n"
+            "        plus a combined index.html linking them all  (default: 1d)"
+        )
+    )
+    parser.add_argument(
+        "--force", "-f",
+        action="store_true",
+        help="Skip freshness check and market-hours gate — always run a full scan"
+    )
+    args = parser.parse_args()
+
+    scan_time = datetime.now().strftime("%d %b %Y  %H:%M:%S")
+
+    print(f"\nTrendBreak Pro v3  ·  {len(NSE_STOCKS)+len(NYSE_STOCKS)} stocks  ·  20 trendline types  ·  {scan_time}")
+    print(f"  16 fixes applied — see file header for changelog")
+
+    # ── Market-hours gate: decide which exchanges to scan ──────────────────────
+    nse_open, nyse_open = market_status()
+
+    if args.force:
+        nse_open = nyse_open = True
+        print("  ⚡  --force flag set — scanning both NSE + NYSE regardless of market hours\n")
+    else:
+        if not nse_open and not nyse_open:
+            print("  ⏸  Both NSE and NYSE are currently closed — nothing to scan.")
+            print("     NSE  : Mon–Fri  09:15–15:30 IST")
+            print("     NYSE : Mon–Fri  09:00–19:00 ET")
+            print("     Run with --force to scan anyway.\n")
+            sys.exit(0)
+        if nse_open:
+            print(f"  ✅  NSE is OPEN  (09:15–15:30 IST) → scanning {len(NSE_STOCKS)} NSE stocks")
+        else:
+            print(f"  🔒  NSE is CLOSED → skipping NSE stocks entirely")
+        if nyse_open:
+            print(f"  ✅  NYSE is OPEN (09:00–19:00 ET)  → scanning {len(NYSE_STOCKS)} NYSE stocks")
+        else:
+            print(f"  🔒  NYSE is CLOSED → skipping NYSE stocks entirely")
+        print()
+
+    nse_to_scan  = NSE_STOCKS  if nse_open  else []
+    nyse_to_scan = NYSE_STOCKS if nyse_open else []
+
+    # ── Decide which timeframes to run ────────────────────────────────────────
+    if args.timeframe == "all":
+        timeframes_to_run = ALL_TF
+        print(f"  ⏱  Running ALL 4 timeframes: {' | '.join(TIMEFRAME_CONFIG[t][3] for t in timeframes_to_run)}")
+        print(f"     Each TF fetches its own data — 15m volume ≠ 1d volume ✓\n")
+    else:
+        timeframes_to_run = [args.timeframe]
+        print(f"  ⏱  Timeframe: {TIMEFRAME_CONFIG[args.timeframe][3]}\n")
+
+    # ── Run each timeframe ────────────────────────────────────────────────────
+    tf_reports = []   # (tf, tf_label, out_path, n_bull, n_bear, n_vol, n_total)
+
+    for tf in timeframes_to_run:
+        all_results, vol_spikes, out_path, tf_label = run_single_timeframe(
+            tf, nse_to_scan, nyse_to_scan, scan_time, force=args.force
+        )
+        bull  = [r for r in all_results if r["signal"] == "BULLISH"]
+        bear  = [r for r in all_results if r["signal"] == "BEARISH"]
+        vol_c = [r for r in all_results if r.get("vol_confirmed")]
+        tf_reports.append((tf, tf_label, out_path, len(bull), len(bear), len(vol_c), len(all_results)))
+
+        # Telegram alerts per timeframe
+        tg = _tg_cfg()
+        if tg:
+            print(f"    Sending Telegram alerts [{tf_label}]…", end="", flush=True)
+            tg_send_breakout_alerts(all_results, tf_label, scan_time)
+            tg_send_volume_spike_alerts(vol_spikes, tf_label, scan_time)
+            print(" ✅ Sent")
+
+    # ── If multi-TF, write a combined index page ───────────────────────────────
+    if len(timeframes_to_run) > 1:
+        idx_path = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)),
+                                 "trendline_breakout_ALL_index.html")
+        idx_html = generate_combined_index(tf_reports, scan_time)
+        with open(idx_path, "w", encoding="utf-8") as f:
+            f.write(idx_html)
+        print(f"\n  ✅  All {len(timeframes_to_run)} timeframes complete.")
+        print(f"  📄  Combined index → {idx_path}")
+        for tf, tf_label, out_path, *_ in tf_reports:
+            print(f"      [{tf_label:>6}]  {out_path}")
+    else:
+        tf, tf_label, out_path, *_ = tf_reports[0]
+        # Telegram status for single-TF run
+        tg = _tg_cfg()
+        if not tg:
+            cfg_tg = CONFIG.get("telegram", {})
+            if not cfg_tg.get("enabled", False):
+                print("  ℹ️  Telegram alerts disabled in config.json")
+            elif cfg_tg.get("bot_token","") in ("","YOUR_BOT_TOKEN_HERE") or \
+                 str(cfg_tg.get("chat_id","")) in ("","YOUR_CHAT_ID_HERE"):
+                print("  ⚠️  Telegram not configured — fill bot_token & chat_id in config.json")
+
+    print()
 
 if __name__ == "__main__":
     main()
