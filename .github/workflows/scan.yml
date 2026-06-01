@@ -68,8 +68,7 @@ jobs:
       - name: Run NSE Trendline Scanner
         run: |
           python trendline_scanner.py \
-            --timeframe ${{ inputs.timeframe || '1d' }} \
-            --force
+            --timeframe ${{ inputs.timeframe || '1d' }}
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -123,8 +122,7 @@ jobs:
       - name: Run NYSE Trendline Scanner
         run: |
           python trendline_scanner.py \
-            --timeframe ${{ inputs.timeframe || '1d' }} \
-            --force
+            --timeframe ${{ inputs.timeframe || '1d' }}
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
