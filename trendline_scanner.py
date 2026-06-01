@@ -84,15 +84,38 @@ warnings.filterwarnings("ignore")
 
 # ── Config loader ────────────────────────────────────────────────────────────
 def load_config():
-    """Load config.json from same directory as this script. Returns dict."""
+    """
+    Load Telegram config with the following priority order:
+      1. Environment variables  TELEGRAM_BOT_TOKEN  and  TELEGRAM_CHAT_ID
+         (set via GitHub Actions Secrets — preferred for CI)
+      2. config.json in the same directory as this script
+         (used for local runs)
+    """
     import os as _os2
+
+    # ── Priority 1: GitHub Secrets / environment variables ────────────────────
+    env_token = _os2.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    env_chat  = _os2.environ.get("TELEGRAM_CHAT_ID",  "").strip()
+
+    if env_token and env_chat:
+        print("  ✅  Telegram credentials loaded from environment variables.")
+        return {
+            "telegram": {
+                "enabled":   True,
+                "bot_token": env_token,
+                "chat_id":   env_chat,
+            }
+        }
+
+    # ── Priority 2: config.json (local development) ───────────────────────────
     cfg_path = _os2.path.join(_os2.path.dirname(_os2.path.abspath(__file__)), "config.json")
     if not _os2.path.exists(cfg_path):
-        print(f"  ⚠️  config.json not found at {cfg_path} — Telegram alerts disabled.")
+        print(f"  ⚠️  config.json not found and no env vars set — Telegram alerts disabled.")
         return {}
     try:
         with open(cfg_path, "r", encoding="utf-8") as f:
             cfg = _json_cfg.load(f)
+        print("  ✅  Telegram credentials loaded from config.json.")
         return cfg
     except Exception as e:
         print(f"  ⚠️  Could not read config.json: {e} — Telegram alerts disabled.")
@@ -2622,6 +2645,7 @@ def detect_volume_spikes(all_stocks_data):
                 "cur_vol":      int(cur_vol),
                 "avg_vol":      int(avg_vol),
                 "vol_ratio":    vol_ratio,
+                "vol_ok":       vol_ratio >= 1.5,  # FIX: was missing; used by vol-confirmed filter
                 "candle_time":  candle_time_str,   # date+time of the spike candle
                 "has_breakout": False,   # patched in generate_html
                 "breakout_signals": [],  # patched in generate_html
@@ -2792,8 +2816,8 @@ def run_single_timeframe(tf, nse_to_scan, nyse_to_scan, scan_time, force=False):
     # Volume spikes
     print(f"    Building volume spike tracker…", end="", flush=True)
     all_stocks_live = (
-        [(t, n, p, i, "NSE",  True) for i,(t,n,p) in enumerate(nse_to_scan)] +
-        [(t, n, p, i, "NYSE", True) for i,(t,n,p) in enumerate(nyse_to_scan)]
+        [(t, n, p, i, "NSE",  True) for i,(t,n,p) in enumerate(NSE_STOCKS)] +
+        [(t, n, p, i, "NYSE", True) for i,(t,n,p) in enumerate(NYSE_STOCKS)]
     )
     vol_spikes = detect_volume_spikes(all_stocks_live)
     print(f" {len(vol_spikes)} stocks tracked")
@@ -2904,7 +2928,7 @@ def main():
             "        plus a combined index.html linking them all  (default: 1d)"
         )
     )
-    # --force flag removed: time restriction is disabled; scanner always runs both exchanges
+    # --force flag removed: time restriction disabled; scanner always runs both exchanges
     args = parser.parse_args()
 
     scan_time = datetime.now().strftime("%d %b %Y  %H:%M:%S")
@@ -2913,7 +2937,6 @@ def main():
     print(f"  16 fixes applied — see file header for changelog")
 
     # ── Market-hours gate REMOVED — always scan both NSE + NYSE ─────────────────
-    # Time restriction has been removed; scanner runs anytime without --force flag.
     print(f"  ✅  Scanning NSE  → {len(NSE_STOCKS)} stocks")
     print(f"  ✅  Scanning NYSE → {len(NYSE_STOCKS)} stocks\n")
 
