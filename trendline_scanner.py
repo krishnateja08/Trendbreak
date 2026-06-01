@@ -2645,7 +2645,7 @@ def detect_volume_spikes(all_stocks_data):
                 "cur_vol":      int(cur_vol),
                 "avg_vol":      int(avg_vol),
                 "vol_ratio":    vol_ratio,
-                "vol_ok":       vol_ratio >= 1.5,  # FIX: was missing; used by vol-confirmed filter
+                "vol_ok":       vol_ratio >= 1.5,  # FIX: was missing — used by vol-confirmed filter
                 "candle_time":  candle_time_str,   # date+time of the spike candle
                 "has_breakout": False,   # patched in generate_html
                 "breakout_signals": [],  # patched in generate_html
@@ -2815,6 +2815,7 @@ def run_single_timeframe(tf, nse_to_scan, nyse_to_scan, scan_time, force=False):
 
     # Volume spikes
     print(f"    Building volume spike tracker…", end="", flush=True)
+    # FIX: always use full stock universe for vol spikes — never empty regardless of market hours
     all_stocks_live = (
         [(t, n, p, i, "NSE",  True) for i,(t,n,p) in enumerate(NSE_STOCKS)] +
         [(t, n, p, i, "NYSE", True) for i,(t,n,p) in enumerate(NYSE_STOCKS)]
@@ -2928,7 +2929,7 @@ def main():
             "        plus a combined index.html linking them all  (default: 1d)"
         )
     )
-    # --force flag removed: time restriction disabled; scanner always runs both exchanges
+    # --force flag removed: time restriction is disabled; scanner always runs both exchanges
     args = parser.parse_args()
 
     scan_time = datetime.now().strftime("%d %b %Y  %H:%M:%S")
@@ -2937,6 +2938,7 @@ def main():
     print(f"  16 fixes applied — see file header for changelog")
 
     # ── Market-hours gate REMOVED — always scan both NSE + NYSE ─────────────────
+    # Time restriction removed: scanner runs anytime on GitHub Actions or locally.
     print(f"  ✅  Scanning NSE  → {len(NSE_STOCKS)} stocks")
     print(f"  ✅  Scanning NYSE → {len(NYSE_STOCKS)} stocks\n")
 
