@@ -84,38 +84,15 @@ warnings.filterwarnings("ignore")
 
 # ── Config loader ────────────────────────────────────────────────────────────
 def load_config():
-    """
-    Load Telegram config with the following priority order:
-      1. Environment variables  TELEGRAM_BOT_TOKEN  and  TELEGRAM_CHAT_ID
-         (set via GitHub Actions Secrets — preferred for CI)
-      2. config.json in the same directory as this script
-         (used for local runs)
-    """
+    """Load config.json from same directory as this script. Returns dict."""
     import os as _os2
-
-    # ── Priority 1: GitHub Secrets / environment variables ────────────────────
-    env_token = _os2.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-    env_chat  = _os2.environ.get("TELEGRAM_CHAT_ID",  "").strip()
-
-    if env_token and env_chat:
-        print("  ✅  Telegram credentials loaded from environment variables.")
-        return {
-            "telegram": {
-                "enabled":   True,
-                "bot_token": env_token,
-                "chat_id":   env_chat,
-            }
-        }
-
-    # ── Priority 2: config.json (local development) ───────────────────────────
     cfg_path = _os2.path.join(_os2.path.dirname(_os2.path.abspath(__file__)), "config.json")
     if not _os2.path.exists(cfg_path):
-        print(f"  ⚠️  config.json not found and no env vars set — Telegram alerts disabled.")
+        print(f"  ⚠️  config.json not found at {cfg_path} — Telegram alerts disabled.")
         return {}
     try:
         with open(cfg_path, "r", encoding="utf-8") as f:
             cfg = _json_cfg.load(f)
-        print("  ✅  Telegram credentials loaded from config.json.")
         return cfg
     except Exception as e:
         print(f"  ⚠️  Could not read config.json: {e} — Telegram alerts disabled.")
@@ -176,81 +153,45 @@ _DIVIDER = "\u2500" * 28   # ─────────────────
 
 def _fmt_breakout_row(r, arrow):
     """
-    Format one trendline signal for Telegram using full visual legend:
+    Format one trendline signal for Telegram — 3 clean lines per stock:
 
-    Legend:
-      Bullish signal      \u25b2 (▲) per row  /  \U0001f7e2 (🟢) in header
-      Bearish signal      \u25bc (▼) per row  /  \U0001f534 (🔴) in header
-      Price % up          📈 bold +X.XX%
-      Price % down        📉 bold -X.XX%
-      RSI >= 70           🌡 bold RSI  (overbought)
-      RSI <= 30           🧊 bold RSI  (oversold)
-      Vol confirmed >=3x  🔥🔥 Vol ✅
-      Vol confirmed <3x   🔥 Vol ✅
-      Vol elevated >=1.5x ⚡ Vol X.Xx
+      ▲ TICKER  (exchange flag)          ← ticker + direction
+         Company Name                    ← full name, indented
+         ₹Price  +X.XX%  RSI: XX  Vol: X.Xx ✓    ← key metrics
+         📐 #N  TL Type Name             ← trendline detail
     """
-    exchange  = r.get("exchange", "")
-    price     = r.get("price", 0)
-    chg       = float(r.get("change", 0))
-    rsi       = r.get("rsi", "")
-    vol       = float(r.get("vol_ratio", 0))
-    vol_ok    = r.get("vol_ok", False)
-    ccy       = _ccy(exchange)
+    exchange = r.get("exchange", "")
+    price    = r.get("price", 0)
+    chg      = float(r.get("change", 0))
+    chg_s    = ("+{:.2f}%".format(chg)) if chg >= 0 else "{:.2f}%".format(chg)
+    rsi      = r.get("rsi", "")
+    rsi_s    = "  RSI: {}".format(rsi) if rsi != "" else ""
+    vol      = float(r.get("vol_ratio", 0))
+    vol_s    = "  Vol: <b>{:.1f}x</b> \u2714".format(vol) if r.get("vol_ok") else "  Vol: {:.1f}x".format(vol)
+    ccy      = _ccy(exchange)
     exch_flag = "\U0001f1ee\U0001f1f3" if exchange == "NSE" else "\U0001f1fa\U0001f1f8"
 
-    # ── Price change with directional emoji ───────────────────────────────────
-    if chg >= 0:
-        chg_s = "\U0001f4c8 <b>+{:.2f}%</b>".format(chg)   # 📈
-    else:
-        chg_s = "\U0001f4c9 <b>{:.2f}%</b>".format(chg)    # 📉
-
-    # ── RSI badge ─────────────────────────────────────────────────────────────
-    if rsi != "":
-        rsi_val = float(rsi)
-        if rsi_val >= 70:
-            rsi_s = "  \U0001f321 <b>RSI:{}</b>".format(int(rsi_val))   # 🌡 overbought
-        elif rsi_val <= 30:
-            rsi_s = "  \U0001f9ca <b>RSI:{}</b>".format(int(rsi_val))   # 🧊 oversold
-        else:
-            rsi_s = "  RSI:{}".format(int(rsi_val))                       # plain
-    else:
-        rsi_s = ""
-
-    # ── Volume badge ──────────────────────────────────────────────────────────
-    if vol_ok and vol >= 3.0:
-        vol_s = "  \U0001f525\U0001f525 Vol \u2705"       # 🔥🔥 Vol ✅  (>=3x confirmed)
-    elif vol_ok:
-        vol_s = "  \U0001f525 Vol \u2705"                  # 🔥 Vol ✅   (confirmed <3x)
-    elif vol >= 1.5:
-        vol_s = "  \u26a1 Vol {:.1f}x".format(vol)         # ⚡ Vol X.Xx (elevated)
-    else:
-        vol_s = "  Vol {:.1f}x".format(vol)                  # plain
-
-    # ── Trendline type line ───────────────────────────────────────────────────
-    tl_num  = r.get("num", "")
-    tl_type = r.get("type", r.get("tl_type", ""))
-    tl_line = "\U0001f4d0 #{} {}".format(tl_num, tl_type) if tl_num else "\U0001f4d0 {}".format(tl_type)
+    # TL type: pull num + type name for the detail line
+    tl_num   = r.get("num", "")
+    tl_type  = r.get("type", r.get("tl_type", ""))
+    tl_line  = "\U0001f4d0 #{} {}".format(tl_num, tl_type) if tl_num else "\U0001f4d0 {}".format(tl_type)
 
     return (
         "{arrow} <b>{ticker}</b>  {flag}".format(
             arrow=arrow, ticker=r["ticker"], flag=exch_flag) + "\n"
         "   <i>{name}</i>".format(name=r["name"]) + "\n"
-        "   {ccy}{price}  {chg}{rsi}{vol}".format(
-            ccy=ccy, price=price, chg=chg_s, rsi=rsi_s, vol=vol_s) + "\n"
+        "   {ccy}{price}{chg}{rsi}{vol}".format(
+            ccy=ccy, price=price, chg="  " + chg_s, rsi=rsi_s, vol=vol_s) + "\n"
         "   {tl}".format(tl=tl_line)
     )
 
 def _fmt_spike_row(s):
     """
-    Format one volume spike for Telegram using full visual legend:
+    Format one volume spike for Telegram — 3 clean lines per stock:
 
-    Legend:
-      Vol spike >= 5x    🔥🔥 bold X.XXx
-      Vol spike >= 2x    🔥 bold X.XXx
-      Vol spike < 2x     ⚡ X.XXx
-      Price % up         📈 bold +X.XX%
-      Price % down       📉 bold -X.XX%
-      Breakout tag       ⚡ Breakout (inline on first line)
+      ▲ TICKER   11.51x  ⚡ Breakout     ← direction + vol ratio + breakout tag
+         Company Name                    ← full name, indented
+         ₹Price  +X.XX%  📅 27 May       ← price, change, candle date
     """
     ticker    = s.get("ticker", "")
     name      = s.get("name", "")
@@ -258,34 +199,22 @@ def _fmt_spike_row(s):
     price     = s.get("price", 0)
     vol_ratio = s.get("vol_ratio", 0)
     chg       = s.get("candle_chg", 0)
+    chg_s     = ("+{:.2f}%".format(chg)) if chg >= 0 else "{:.2f}%".format(chg)
     direction = "\u25b2" if s.get("direction") == "UP" else "\u25bc"
     ccy       = _ccy(exchange)
 
-    # ── Price change with directional emoji ───────────────────────────────────
-    if chg >= 0:
-        chg_s = "\U0001f4c8 <b>+{:.2f}%</b>".format(chg)   # 📈
-    else:
-        chg_s = "\U0001f4c9 <b>{:.2f}%</b>".format(chg)    # 📉
-
-    # ── Vol spike badge on first line ─────────────────────────────────────────
-    if vol_ratio >= 5.0:
-        vol_badge = "\U0001f525\U0001f525 <b>{:.2f}x</b>".format(vol_ratio)   # 🔥🔥 bold
-    elif vol_ratio >= 2.0:
-        vol_badge = "\U0001f525 <b>{:.2f}x</b>".format(vol_ratio)              # 🔥 bold
-    else:
-        vol_badge = "\u26a1 {:.2f}x".format(vol_ratio)                         # ⚡ plain
-
-    # ── Breakout tag — inline on first line if present ────────────────────────
+    # Breakout tag — shown inline on first line if present
     breakout_tag = "  \u26a1 <b>Breakout</b>" if s.get("has_breakout") else ""
 
-    # ── Shorten candle time to date only ──────────────────────────────────────
-    raw_candle  = s.get("candle_time", "")
+    # Shorten candle time: show only date part (drop the time + IST suffix)
+    raw_candle = s.get("candle_time", "")
+    # Format: "27 May 2026  14:30 IST"  →  "27 May 2026"
     candle_date = raw_candle.split("  ")[0].strip() if "  " in raw_candle else raw_candle
 
     return (
-        "{dir} <b>{ticker}</b>   {vbadge}{bk}".format(
+        "{dir} <b>{ticker}</b>   <b>{ratio:.2f}x</b>{bk}".format(
             dir=direction, ticker=ticker,
-            vbadge=vol_badge, bk=breakout_tag) + "\n"
+            ratio=vol_ratio, bk=breakout_tag) + "\n"
         "   <i>{name}</i>".format(name=name) + "\n"
         "   {ccy}{price}  {chg}  \U0001f4c5 {date}".format(
             ccy=ccy, price=price, chg=chg_s, date=candle_date)
@@ -334,11 +263,10 @@ def tg_send_breakout_alerts(results, tf_label, scan_time):
             buckets[key].append(r)
 
     labels = {
-        # 🟢 header for bullish, 🔴 header for bearish
-        ("NSE",  "BULLISH"): ("\U0001f7e2 \U0001f1ee\U0001f1f3 NSE \U0001f4c8 BULLISH Breakouts",  "\u25b2"),
-        ("NSE",  "BEARISH"): ("\U0001f534 \U0001f1ee\U0001f1f3 NSE \U0001f4c9 BEARISH Breakouts",  "\u25bc"),
-        ("NYSE", "BULLISH"): ("\U0001f7e2 \U0001f1fa\U0001f1f8 NYSE \U0001f4c8 BULLISH Breakouts", "\u25b2"),
-        ("NYSE", "BEARISH"): ("\U0001f534 \U0001f1fa\U0001f1f8 NYSE \U0001f4c9 BEARISH Breakouts", "\u25bc"),
+        ("NSE",  "BULLISH"): ("\U0001f1ee\U0001f1f3 NSE \U0001f4c8 BULLISH Breakouts",  "\u25b2"),
+        ("NSE",  "BEARISH"): ("\U0001f1ee\U0001f1f3 NSE \U0001f4c9 BEARISH Breakouts",  "\u25bc"),
+        ("NYSE", "BULLISH"): ("\U0001f1fa\U0001f1f8 NYSE \U0001f4c8 BULLISH Breakouts", "\u25b2"),
+        ("NYSE", "BEARISH"): ("\U0001f1fa\U0001f1f8 NYSE \U0001f4c9 BEARISH Breakouts", "\u25bc"),
     }
 
     for key, rows in buckets.items():
@@ -2837,7 +2765,7 @@ def run_single_timeframe(tf, nse_to_scan, nyse_to_scan, scan_time, force=False):
     out_path    = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                f"trendline_breakout_{tf}_report.html")
 
-    print(f"\n  ── Timeframe: {tf_label} ({'--force' if force else 'normal'}) ─────────────────")
+    print(f"\n  ── Timeframe: {tf_label} ─────────────────────────────────────────")
 
     all_results = []
     done = 0
@@ -2976,11 +2904,7 @@ def main():
             "        plus a combined index.html linking them all  (default: 1d)"
         )
     )
-    parser.add_argument(
-        "--force", "-f",
-        action="store_true",
-        help="Skip freshness check and market-hours gate — always run a full scan"
-    )
+    # --force flag removed: time restriction is disabled; scanner always runs both exchanges
     args = parser.parse_args()
 
     scan_time = datetime.now().strftime("%d %b %Y  %H:%M:%S")
@@ -2988,31 +2912,13 @@ def main():
     print(f"\nTrendBreak Pro v3  ·  {len(NSE_STOCKS)+len(NYSE_STOCKS)} stocks  ·  20 trendline types  ·  {scan_time}")
     print(f"  16 fixes applied — see file header for changelog")
 
-    # ── Market-hours gate: decide which exchanges to scan ──────────────────────
-    nse_open, nyse_open = market_status()
+    # ── Market-hours gate REMOVED — always scan both NSE + NYSE ─────────────────
+    # Time restriction has been removed; scanner runs anytime without --force flag.
+    print(f"  ✅  Scanning NSE  → {len(NSE_STOCKS)} stocks")
+    print(f"  ✅  Scanning NYSE → {len(NYSE_STOCKS)} stocks\n")
 
-    if args.force:
-        nse_open = nyse_open = True
-        print("  ⚡  --force flag set — scanning both NSE + NYSE regardless of market hours\n")
-    else:
-        if not nse_open and not nyse_open:
-            print("  ⏸  Both NSE and NYSE are currently closed — nothing to scan.")
-            print("     NSE  : Mon–Fri  09:15–15:30 IST")
-            print("     NYSE : Mon–Fri  09:00–19:00 ET")
-            print("     Run with --force to scan anyway.\n")
-            sys.exit(0)
-        if nse_open:
-            print(f"  ✅  NSE is OPEN  (09:15–15:30 IST) → scanning {len(NSE_STOCKS)} NSE stocks")
-        else:
-            print(f"  🔒  NSE is CLOSED → skipping NSE stocks entirely")
-        if nyse_open:
-            print(f"  ✅  NYSE is OPEN (09:00–19:00 ET)  → scanning {len(NYSE_STOCKS)} NYSE stocks")
-        else:
-            print(f"  🔒  NYSE is CLOSED → skipping NYSE stocks entirely")
-        print()
-
-    nse_to_scan  = NSE_STOCKS  if nse_open  else []
-    nyse_to_scan = NYSE_STOCKS if nyse_open else []
+    nse_to_scan  = NSE_STOCKS
+    nyse_to_scan = NYSE_STOCKS
 
     # ── Decide which timeframes to run ────────────────────────────────────────
     if args.timeframe == "all":
@@ -3028,7 +2934,7 @@ def main():
 
     for tf in timeframes_to_run:
         all_results, vol_spikes, out_path, tf_label = run_single_timeframe(
-            tf, nse_to_scan, nyse_to_scan, scan_time, force=args.force
+            tf, nse_to_scan, nyse_to_scan, scan_time, force=True
         )
         bull  = [r for r in all_results if r["signal"] == "BULLISH"]
         bear  = [r for r in all_results if r["signal"] == "BEARISH"]
