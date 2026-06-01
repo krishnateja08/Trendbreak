@@ -2694,7 +2694,6 @@ def detect_volume_spikes(all_stocks_data):
                 "cur_vol":      int(cur_vol),
                 "avg_vol":      int(avg_vol),
                 "vol_ratio":    vol_ratio,
-                "vol_ok":       vol_ratio >= 1.5,  # FIX: was missing; used by vol-confirmed filter
                 "candle_time":  candle_time_str,   # date+time of the spike candle
                 "has_breakout": False,   # patched in generate_html
                 "breakout_signals": [],  # patched in generate_html
@@ -2862,13 +2861,11 @@ def run_single_timeframe(tf, nse_to_scan, nyse_to_scan, scan_time, force=False):
     print(f"\r    [{tf_label}] Scanning [{'█'*40}] {total_stocks}/{total_stocks}  ✅ Done")
     print(f"    Signals: {len(all_results)} total  |  🟢 {len(bull)} Bullish  |  🔴 {len(bear)} Bearish")
 
-    # Volume spikes — always scan full universe regardless of market hours gate
-    # (FIX: was using nse_to_scan/nyse_to_scan which are [] when market is closed,
-    #  causing the Volume Spike tab to show blank for both NSE and NYSE)
+    # Volume spikes
     print(f"    Building volume spike tracker…", end="", flush=True)
     all_stocks_live = (
-        [(t, n, p, i, "NSE",  True) for i,(t,n,p) in enumerate(NSE_STOCKS)] +
-        [(t, n, p, i, "NYSE", True) for i,(t,n,p) in enumerate(NYSE_STOCKS)]
+        [(t, n, p, i, "NSE",  True) for i,(t,n,p) in enumerate(nse_to_scan)] +
+        [(t, n, p, i, "NYSE", True) for i,(t,n,p) in enumerate(nyse_to_scan)]
     )
     vol_spikes = detect_volume_spikes(all_stocks_live)
     print(f" {len(vol_spikes)} stocks tracked")
