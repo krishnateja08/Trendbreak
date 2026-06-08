@@ -2,7 +2,8 @@
 ╔══════════════════════════════════════════════════════════════╗
 ║   TRENDLINE BREAKOUT SCANNER — NSE & NYSE                   ║
 ║   ALL 20 Price Action Trendline Types Applied               ║
-║   Output: Beautiful HTML Report                             ║
+║   + S1 / R1 Support & Resistance (Timeframe-Aware)          ║
+║   Output: Beautiful HTML Report + Rich Telegram Alerts      ║
 ╚══════════════════════════════════════════════════════════════╝
 
 20 TRENDLINE TYPES:
@@ -42,6 +43,41 @@ FIXES APPLIED (v2):
   FIX-11  Role reversal: proximity band widened 2%→3%
   FIX-12  Base range threshold: exchange-aware (0.20 NSE, 0.15 NYSE)
   FIX-13  Flag pole threshold: exchange-aware (7% NSE, 4% NYSE)
+
+FIXES APPLIED (v3.1):
+  FIX-18  Market-hours gate disabled by default: --force is now True by
+           default so the scanner runs at any time without extra flags.
+           Pass --no-force (or edit default=False) to restore gating.
+
+ADDED (v4 — S1/R1 Support & Resistance Engine):
+  SR-01  calculate_sr() — proximity-first, timeframe-aware swing-based
+         S1 (nearest support) and R1 (nearest resistance) for every stock.
+         Per-timeframe settings identical to trendline_scanner_nyse.py v5:
+           15m : lb=5, recent=80 bars, tol=0.3%, cap=2.5%, fallback=1.0%
+           1h  : lb=6, recent=100 bars, tol=0.5%, cap=4.0%, fallback=1.5%
+           4h  : lb=7, recent=90 bars,  tol=0.8%, cap=6.0%, fallback=2.5%
+           1d  : lb=8, recent=60 bars,  tol=1.2%, cap=8.0%, fallback=3.0%
+         Pivot = previous bar HLC/3. Falls back cleanly to pct-based level
+         if no real swing found within the distance cap.
+  SR-02  scan_stock() enriched: sr dict from calculate_sr() merged into
+         base_info so every signal dict carries s1, r1, pivot fields.
+  SR-03  Telegram _fmt_breakout_row() upgraded to nyse-style card layout:
+         colored dot (🟢/🔴), RSI zone label, vol fire rating, plus
+         🟢 S1 / 🔴 R1 two-line S/R block, tier badge, trend bias, quality.
+  SR-04  Telegram _fmt_spike_row() upgraded: colored dot, fire-rated vol,
+         📈/📉 bold % change with icons, matching nyse v5 style.
+  SR-05  tg_send_breakout_alerts() upgraded: ━━━ thick borders, ╌╌╌ thin
+         separators between cards, 🟢🟢🟢/🔴🔴🔴 emoji lead lines,
+         📗/📕 book emoji headers — NSE + NYSE both get full treatment.
+  SR-06  tg_send_volume_spike_alerts() upgraded: identical 4-bucket split
+         (NSE UP / NSE DOWN / NYSE UP / NYSE DOWN) with matching borders.
+  SR-07  Multi-bot support ported from nyse scanner: config.json "bots"
+         array accepted alongside legacy single-bot fields.
+  SR-08  HTML table: S1 and R1 columns added after TL Level; color-coded
+         green for S1, red for R1.
+  SR-09  _DIVIDER_THICK / _DIVIDER_THIN constants added; legacy _DIVIDER
+         kept for backward-compatibility.
+═══════════════════════════════════════════════════════════════
 
 FIXES APPLIED (v3):
   FIX-14  Market-hours gate: skips live fetch when both NSE & NYSE are closed
@@ -84,38 +120,15 @@ warnings.filterwarnings("ignore")
 
 # ── Config loader ────────────────────────────────────────────────────────────
 def load_config():
-    """
-    Load Telegram config with the following priority order:
-      1. Environment variables  TELEGRAM_BOT_TOKEN  and  TELEGRAM_CHAT_ID
-         (set via GitHub Actions Secrets — preferred for CI)
-      2. config.json in the same directory as this script
-         (used for local runs)
-    """
+    """Load config.json from same directory as this script. Returns dict."""
     import os as _os2
-
-    # ── Priority 1: GitHub Secrets / environment variables ────────────────────
-    env_token = _os2.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-    env_chat  = _os2.environ.get("TELEGRAM_CHAT_ID",  "").strip()
-
-    if env_token and env_chat:
-        print("  ✅  Telegram credentials loaded from environment variables.")
-        return {
-            "telegram": {
-                "enabled":   True,
-                "bot_token": env_token,
-                "chat_id":   env_chat,
-            }
-        }
-
-    # ── Priority 2: config.json (local development) ───────────────────────────
     cfg_path = _os2.path.join(_os2.path.dirname(_os2.path.abspath(__file__)), "config.json")
     if not _os2.path.exists(cfg_path):
-        print(f"  ⚠️  config.json not found and no env vars set — Telegram alerts disabled.")
+        print(f"  ⚠️  config.json not found at {cfg_path} — Telegram alerts disabled.")
         return {}
     try:
         with open(cfg_path, "r", encoding="utf-8") as f:
             cfg = _json_cfg.load(f)
-        print("  ✅  Telegram credentials loaded from config.json.")
         return cfg
     except Exception as e:
         print(f"  ⚠️  Could not read config.json: {e} — Telegram alerts disabled.")
@@ -123,42 +136,100 @@ def load_config():
 
 CONFIG = load_config()
 
-# ── Telegram Alert Module ────────────────────────────────────────────────────
-def _tg_cfg():
-    """Return telegram config dict or None if disabled/missing."""
-    tg = CONFIG.get("telegram", {})
-    if not tg.get("enabled", False):
-        return None
-    token = tg.get("bot_token", "")
-    chat  = tg.get("chat_id", "")
-    if not token or token == "YOUR_BOT_TOKEN_HERE":
-        return None
-    if not chat or str(chat) == "YOUR_CHAT_ID_HERE":
-        return None
-    return tg
+# ── Multi-Bot Telegram Module ─────────────────────────────────────────────────
+# Supports MULTIPLE bots via config.json "bots" array.
+# Also supports legacy single-bot "bot_token"/"chat_id" fields — fully backward-compatible.
+#
+# config.json format (multi-bot):
+# {
+#   "telegram": {
+#     "enabled": true,
+#     "alerts": { ... },          ← shared alert settings for all bots
+#     "bots": [
+#       { "name": "Bot1", "bot_token": "111:AAA...", "chat_id": "-100123" },
+#       { "name": "Bot2", "bot_token": "222:BBB...", "chat_id": "-100456" }
+#     ]
+#   }
+# }
+#
+# Legacy single-bot (still works — no migration needed):
+# {
+#   "telegram": { "bot_token": "111:AAA...", "chat_id": "-100123", "alerts": { ... } }
+# }
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_active_bots():
+    """
+    Return a list of active bot dicts: [{"name", "bot_token", "chat_id"}, ...]
+    Reads from config.json "bots" array (multi-bot) or legacy single-bot fields.
+    Only returns bots with both bot_token and chat_id set and non-placeholder.
+    """
+    tg_cfg = CONFIG.get("telegram", {})
+    if not tg_cfg.get("enabled", True):
+        return []
+
+    active = []
+
+    # ── Multi-bot array (new format) ──────────────────────────────────────────
+    bots_list = tg_cfg.get("bots", [])
+    for i, bot in enumerate(bots_list):
+        token = str(bot.get("bot_token", "")).strip()
+        chat  = str(bot.get("chat_id",   "")).strip()
+        name  = bot.get("name", f"Bot{i+1}")
+        if not token or token in ("YOUR_BOT_TOKEN_HERE", ""):
+            continue
+        if not chat  or chat  in ("YOUR_CHAT_ID_HERE",  ""):
+            continue
+        active.append({"name": name, "bot_token": token, "chat_id": chat})
+
+    # ── Legacy single-bot fallback (backward-compatible) ─────────────────────
+    if not bots_list:
+        token = str(tg_cfg.get("bot_token", "")).strip()
+        chat  = str(tg_cfg.get("chat_id",   "")).strip()
+        if token and token != "YOUR_BOT_TOKEN_HERE" and chat and chat != "YOUR_CHAT_ID_HERE":
+            active.append({"name": "Default", "bot_token": token, "chat_id": chat})
+
+    return active
+
+def _get_alerts_cfg():
+    """Return shared alerts config dict (applies to all bots)."""
+    return CONFIG.get("telegram", {}).get("alerts", {})
 
 def tg_send(text):
-    """Send a plain-text message to Telegram. Silently returns False on failure."""
-    tg = _tg_cfg()
-    if not tg:
+    """Send a message to ALL configured bots. Returns True if at least one succeeded."""
+    bots = _get_active_bots()
+    if not bots:
         return False
-    try:
-        url  = f"https://api.telegram.org/bot{tg['bot_token']}/sendMessage"
-        data = urllib.parse.urlencode({
-            "chat_id":    str(tg["chat_id"]),
-            "text":       text,
-            "parse_mode": "HTML",
-        }).encode()
-        req = urllib.request.Request(url, data=data, method="POST")
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.status == 200
-    except Exception as e:
-        print(f"  ⚠️  Telegram send failed: {e}")
-        return False
+    any_ok = False
+    for bot in bots:
+        try:
+            url  = f"https://api.telegram.org/bot{bot['bot_token']}/sendMessage"
+            data = urllib.parse.urlencode({
+                "chat_id":    str(bot["chat_id"]),
+                "text":       text,
+                "parse_mode": "HTML",
+            }).encode()
+            req = urllib.request.Request(url, data=data, method="POST")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status == 200:
+                    any_ok = True
+        except Exception as e:
+            print(f"  ⚠️  Telegram send failed [{bot['name']}]: {e}")
+    return any_ok
+
+def _tg_cfg():
+    """
+    Legacy compatibility shim — returns a dict if at least one bot is configured,
+    so existing callers don't need changes.
+    """
+    bots = _get_active_bots()
+    if not bots:
+        return None
+    return {"alerts": _get_alerts_cfg(), "_multi": True}
 
 def _tg_send_block(lines, split_size=4000):
-    """Join lines into message and send, splitting if over Telegram limit."""
-    msg = "\n".join(lines)
+    """Join lines into message and send to ALL bots, splitting if over Telegram limit."""
+    msg = "\n".join(lines) + "\n\n"   # 2 blank lines gap after each card
     if not msg.strip():
         return
     if len(msg) <= 4096:
@@ -171,50 +242,120 @@ def _tg_send_block(lines, split_size=4000):
 def _ccy(exchange):
     return "\u20b9" if exchange == "NSE" else "$"   # ₹ or $
 
-# ── Divider line used between header and stock rows ───────────────────────────
-_DIVIDER = "\u2500" * 28   # ────────────────────────────────
+# ── Divider lines used in Telegram messages ───────────────────────────────────
+_DIVIDER_THICK = "━" * 22   # ━━━━━━━━━━━━━━━━━━━━━━  message open/close border
+_DIVIDER_THIN  = "╌" * 22   # ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌  between each stock entry
+_DIVIDER = "─" * 28          # legacy compat — kept for any external callers
 
-def _fmt_breakout_row(r, arrow):
+def _fmt_breakout_row(r, arrow, dup_tag=""):
     """
-    Format one trendline signal for Telegram — 3 clean lines per stock:
+    Format one trendline signal for Telegram (nyse-style rich card layout):
 
-      ▲ TICKER  (exchange flag)          ← ticker + direction
-         Company Name                    ← full name, indented
-         ₹Price  +X.XX%  RSI: XX  Vol: X.Xx ✓    ← key metrics
-         📐 #N  TL Type Name             ← trendline detail
+      🟢 ▲ TICKER  Company Name  🇮🇳  ← colored dot + direction
+         ┌───────────────
+      Price  : ₹1234.50  📈 +1.23%
+      RSI    : 62.5 bull
+      Vol    : 🔥 2.3x ✅
+      🟢 S1     : ₹1220.00
+      🔴 R1     : ₹1245.00
+      Signal : #3 Horizontal
+      Tier   : 🟡 early  📈 trend:bullish  🎯 Q:72
+
+    Color logic:
+      Signal header : 🟢 BULLISH  |  🔴 BEARISH
+      % change      : 📈 bold positive  |  📉 bold negative
+      RSI           : 🌡 overbought (>=70)  |  🧊 oversold (<=30)  |  zoned otherwise
+      Volume        : 🔥🔥 extreme (>=3x)  |  🔥 confirmed  |  ⚡ elevated  |  plain
     """
-    exchange = r.get("exchange", "")
-    price    = r.get("price", 0)
-    chg      = float(r.get("change", 0))
-    chg_s    = ("+{:.2f}%".format(chg)) if chg >= 0 else "{:.2f}%".format(chg)
-    rsi      = r.get("rsi", "")
-    rsi_s    = "  RSI: {}".format(rsi) if rsi != "" else ""
-    vol      = float(r.get("vol_ratio", 0))
-    vol_s    = "  Vol: <b>{:.1f}x</b> \u2714".format(vol) if r.get("vol_ok") else "  Vol: {:.1f}x".format(vol)
-    ccy      = _ccy(exchange)
+    exchange  = r.get("exchange", "")
+    signal    = r.get("signal", "BULLISH")
+    price     = r.get("price", 0)
+    chg       = float(r.get("change", 0))
+    vol       = float(r.get("vol_ratio", 0))
+    vol_ok    = r.get("vol_ok", r.get("vol_confirmed", False))
+    rsi_raw   = r.get("rsi", "")
+    ccy       = _ccy(exchange)
     exch_flag = "\U0001f1ee\U0001f1f3" if exchange == "NSE" else "\U0001f1fa\U0001f1f8"
 
-    # TL type: pull num + type name for the detail line
-    tl_num   = r.get("num", "")
-    tl_type  = r.get("type", r.get("tl_type", ""))
-    tl_line  = "\U0001f4d0 #{} {}".format(tl_num, tl_type) if tl_num else "\U0001f4d0 {}".format(tl_type)
+    # ── Direction color dot ───────────────────────────────────────────────────
+    color_dot = "\U0001f7e2" if signal == "BULLISH" else "\U0001f534"  # 🟢 or 🔴
 
+    # ── % change: bold + icon for direction ───────────────────────────────────
+    if chg >= 0:
+        chg_s = "\U0001f4c8 <b>+{:.2f}%</b>".format(chg)   # 📈
+    else:
+        chg_s = "\U0001f4c9 <b>{:.2f}%</b>".format(chg)    # 📉
+
+    # ── RSI zone label ────────────────────────────────────────────────────────
+    if rsi_raw != "" and rsi_raw is not None:
+        rsi_f = float(rsi_raw)
+        if rsi_f >= 70:   rsi_zone_s = "\U0001f321 <b>{:.1f} hot</b>".format(rsi_f)     # 🌡
+        elif rsi_f <= 30: rsi_zone_s = "\U0001f9ca <b>{:.1f} oversold</b>".format(rsi_f) # 🧊
+        elif rsi_f >= 55: rsi_zone_s = "{:.1f} bull".format(rsi_f)
+        elif rsi_f >= 45: rsi_zone_s = "{:.1f} mid".format(rsi_f)
+        else:             rsi_zone_s = "{:.1f} fade".format(rsi_f)
+    else:
+        rsi_zone_s = "—"
+
+    # ── Volume fire rating ─────────────────────────────────────────────────────
+    if vol_ok and vol >= 3.0:
+        vol_zone_s = "\U0001f525\U0001f525 <b>{:.1f}x</b> \u2705".format(vol)  # 🔥🔥
+    elif vol_ok:
+        vol_zone_s = "\U0001f525 <b>{:.1f}x</b> \u2705".format(vol)            # 🔥
+    elif vol >= 1.5:
+        vol_zone_s = "\u26a1 {:.1f}x".format(vol)                               # ⚡
+    else:
+        vol_zone_s = "{:.1f}x".format(vol)
+
+    # ── S1 / R1 values ────────────────────────────────────────────────────────
+    s1_val = r.get("s1", 0.0)
+    r1_val = r.get("r1", 0.0)
+    s1_str = "{ccy}{v:.2f}".format(ccy=ccy, v=float(s1_val)) if s1_val else "—"
+    r1_str = "{ccy}{v:.2f}".format(ccy=ccy, v=float(r1_val)) if r1_val else "—"
+
+    # ── Tier / Quality / Bias ─────────────────────────────────────────────────
+    tier      = r.get("tier", "early")
+    quality   = r.get("quality", "")
+    bias      = r.get("trend_bias", "neutral")
+    tier_icon = "\u2705\u2705" if tier == "confirmed" else "\U0001f7e1"  # ✅✅ or 🟡
+    bias_icon = ("\U0001f4c8" if bias == "bullish"
+                 else "\U0001f4c9" if bias == "bearish"
+                 else "\u23f8")   # 📈 / 📉 / ⏸
+    q_str     = str(int(quality)) if quality != "" else "—"
+
+    # ── TL type ────────────────────────────────────────────────────────────────
+    tl_num  = r.get("num", "")
+    tl_type = r.get("type", r.get("tl_type", ""))
+    tl_str  = "#{} {}".format(tl_num, tl_type) if tl_num else tl_type
+
+    SEP = "\u250c\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500"  # ┌───────────────
     return (
-        "{arrow} <b>{ticker}</b>  {flag}".format(
-            arrow=arrow, ticker=r["ticker"], flag=exch_flag) + "\n"
-        "   <i>{name}</i>".format(name=r["name"]) + "\n"
-        "   {ccy}{price}{chg}{rsi}{vol}".format(
-            ccy=ccy, price=price, chg="  " + chg_s, rsi=rsi_s, vol=vol_s) + "\n"
-        "   {tl}".format(tl=tl_line)
+        "{dot}{arrow} <b>{ticker}</b>  {name}  {flag}{dup}\n".format(
+            dot=color_dot, arrow=arrow,
+            ticker=r["ticker"], name=r["name"], flag=exch_flag, dup=dup_tag)
+        + SEP + "\n"
+        + "Price  : <b>{ccy}{price:.2f}</b>  {chg}\n".format(
+            ccy=ccy, price=float(price), chg=chg_s)
+        + "RSI    : {rsi}\n".format(rsi=rsi_zone_s)
+        + "Vol    : {vol}\n".format(vol=vol_zone_s)
+        + "\U0001f7e2 S1     : <b>{s1}</b>\n".format(s1=s1_str)
+        + "\U0001f534 R1     : <b>{r1}</b>\n".format(r1=r1_str)
+        + "Signal : {tl}\n".format(tl=tl_str)
+        + "Tier   : {ti} {tier}  {bi} {bias}  \U0001f3af Q:{q}".format(
+            ti=tier_icon, tier=tier, bi=bias_icon, bias=bias, q=q_str)
     )
 
 def _fmt_spike_row(s):
     """
-    Format one volume spike for Telegram — 3 clean lines per stock:
+    Format one volume spike for Telegram (nyse v5 style):
 
-      ▲ TICKER   11.51x  ⚡ Breakout     ← direction + vol ratio + breakout tag
-         Company Name                    ← full name, indented
-         ₹Price  +X.XX%  📅 27 May       ← price, change, candle date
+      🟢 ▲ TICKER — Company Name   🔥🔥 5.20x  ⚡ Breakout
+         ₹Price  📈+X.XX%  📅 01 Jun
+
+    Color logic:
+      Direction : 🟢 UP  |  🔴 DOWN
+      Volume    : 🔥🔥 >=5x  |  🔥 >=2x  |  ⚡ <2x
+      % change  : 📈 bold positive  |  📉 bold negative
     """
     ticker    = s.get("ticker", "")
     name      = s.get("name", "")
@@ -222,23 +363,37 @@ def _fmt_spike_row(s):
     price     = s.get("price", 0)
     vol_ratio = s.get("vol_ratio", 0)
     chg       = s.get("candle_chg", 0)
-    chg_s     = ("+{:.2f}%".format(chg)) if chg >= 0 else "{:.2f}%".format(chg)
-    direction = "\u25b2" if s.get("direction") == "UP" else "\u25bc"
+    direction = s.get("direction", "UP")
     ccy       = _ccy(exchange)
 
-    # Breakout tag — shown inline on first line if present
+    dir_arrow  = "\u25b2" if direction == "UP" else "\u25bc"
+    color_dot  = "\U0001f7e2" if direction == "UP" else "\U0001f534"  # 🟢 or 🔴
+
+    # ── Volume fire rating ────────────────────────────────────────────────────
+    if vol_ratio >= 5.0:
+        vol_s = "\U0001f525\U0001f525 <b>{:.2f}x</b>".format(vol_ratio)   # 🔥🔥
+    elif vol_ratio >= 2.0:
+        vol_s = "\U0001f525 <b>{:.2f}x</b>".format(vol_ratio)             # 🔥
+    else:
+        vol_s = "\u26a1 <b>{:.2f}x</b>".format(vol_ratio)                 # ⚡
+
+    # ── % change with direction icon ──────────────────────────────────────────
+    if chg >= 0:
+        chg_s = "\U0001f4c8 <b>+{:.2f}%</b>".format(chg)   # 📈
+    else:
+        chg_s = "\U0001f4c9 <b>{:.2f}%</b>".format(chg)    # 📉
+
+    # ── Breakout tag ──────────────────────────────────────────────────────────
     breakout_tag = "  \u26a1 <b>Breakout</b>" if s.get("has_breakout") else ""
 
-    # Shorten candle time: show only date part (drop the time + IST suffix)
-    raw_candle = s.get("candle_time", "")
-    # Format: "27 May 2026  14:30 IST"  →  "27 May 2026"
+    # ── Candle date ───────────────────────────────────────────────────────────
+    raw_candle  = s.get("candle_time", "")
     candle_date = raw_candle.split("  ")[0].strip() if "  " in raw_candle else raw_candle
 
     return (
-        "{dir} <b>{ticker}</b>   <b>{ratio:.2f}x</b>{bk}".format(
-            dir=direction, ticker=ticker,
-            ratio=vol_ratio, bk=breakout_tag) + "\n"
-        "   <i>{name}</i>".format(name=name) + "\n"
+        "{dot}{dir} <b>{ticker}</b> — {name}   {vol}{bk}".format(
+            dot=color_dot, dir=dir_arrow, ticker=ticker, name=name,
+            vol=vol_s, bk=breakout_tag) + "\n"
         "   {ccy}{price}  {chg}  \U0001f4c5 {date}".format(
             ccy=ccy, price=price, chg=chg_s, date=candle_date)
     )
@@ -246,23 +401,31 @@ def _fmt_spike_row(s):
 def tg_send_breakout_alerts(results, tf_label, scan_time):
     """
     Send 4 separate Telegram messages (one per exchange × direction bucket):
-      1. NSE  Bullish breakouts
+      1. NSE  Bullish breakouts   ← always sent BEFORE Bearish
       2. NSE  Bearish breakouts
-      3. NYSE Bullish breakouts
+      3. NYSE Bullish breakouts   ← always sent BEFORE Bearish
       4. NYSE Bearish breakouts
 
-    Each message layout:
-      ┌─────────────────────────────────┐
-      │  🇮🇳 NSE 📈 BULLISH Breakouts   │  ← bold title
-      │  🕐 28 May 2026  20:40:12        │  ← scan time
-      │  ⏱ 1 Day  |  📊 6 signals       │  ← timeframe + count
-      │  ────────────────────────────   │  ← divider
-      │  ▲ TICKER  🇮🇳                   │
-      │     Company Name                │
-      │     ₹Price  +X.XX%  RSI  Vol    │
-      │     📐 #N  TL Type              │
-      │  ▲ ...                          │
-      └─────────────────────────────────┘
+    Each message layout (nyse v5 style):
+      🟢🟢🟢
+      ━━━━━━━━━━━━━━━━━━━━━━
+      📗 BULLISH BREAKOUTS  🇮🇳 NSE  |  ⏱ 1 Day
+      📊 3 signals  🕐 01 Jun 2026  14:30:00
+      ━━━━━━━━━━━━━━━━━━━━━━
+
+      🟢▲ TICKER  Company Name  🇮🇳
+         ┌───────────────
+         Price  : ₹1234.50  📈+1.23%
+         RSI    : 62.5 bull
+         Vol    : 🔥 2.3x ✅
+         🟢 S1  : ₹1220.00
+         🔴 R1  : ₹1245.00
+         Signal : #3 Horizontal
+         Tier   : 🟡 early  📈 trend:bullish  🎯 Q:72
+
+      ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+      ...
+      ━━━━━━━━━━━━━━━━━━━━━━
     """
     tg = _tg_cfg()
     if not tg:
@@ -286,47 +449,98 @@ def tg_send_breakout_alerts(results, tf_label, scan_time):
             buckets[key].append(r)
 
     labels = {
-        ("NSE",  "BULLISH"): ("\U0001f1ee\U0001f1f3 NSE \U0001f4c8 BULLISH Breakouts",  "\u25b2"),
-        ("NSE",  "BEARISH"): ("\U0001f1ee\U0001f1f3 NSE \U0001f4c9 BEARISH Breakouts",  "\u25bc"),
-        ("NYSE", "BULLISH"): ("\U0001f1fa\U0001f1f8 NYSE \U0001f4c8 BULLISH Breakouts", "\u25b2"),
-        ("NYSE", "BEARISH"): ("\U0001f1fa\U0001f1f8 NYSE \U0001f4c9 BEARISH Breakouts", "\u25bc"),
+        ("NSE",  "BULLISH"): ("\U0001f4d7 <b>BULLISH BREAKOUTS</b>",  "\u25b2"),  # 📗
+        ("NSE",  "BEARISH"): ("\U0001f4d5 <b>BEARISH BREAKOUTS</b>",  "\u25bc"),  # 📕
+        ("NYSE", "BULLISH"): ("\U0001f4d7 <b>BULLISH BREAKOUTS</b>",  "\u25b2"),
+        ("NYSE", "BEARISH"): ("\U0001f4d5 <b>BEARISH BREAKOUTS</b>",  "\u25bc"),
     }
+    exch_flags = {"NSE": "\U0001f1ee\U0001f1f3", "NYSE": "\U0001f1fa\U0001f1f8"}  # 🇮🇳 🇺🇸
 
-    for key, rows in buckets.items():
+    # ── Send Bullish FIRST, then Bearish — explicit ordering per exchange ──────
+    send_order = [
+        ("NSE",  "BULLISH"),
+        ("NSE",  "BEARISH"),
+        ("NYSE", "BULLISH"),
+        ("NYSE", "BEARISH"),
+    ]
+
+    # ── Count how many times each ticker appears (for dup-tag) ────────────────
+    from collections import Counter as _Counter
+    ticker_total = _Counter(r["ticker"] for rows in buckets.values() for r in rows)
+    ticker_dirs  = {}
+    for (exch_k, dir_k), brows in buckets.items():
+        for r in brows:
+            ticker_dirs.setdefault(r["ticker"], set()).add(dir_k)
+
+    for key in send_order:
+        rows = buckets.get(key, [])
         if not rows:
             continue
+        exch, direction = key
         title, arrow = labels[key]
+        flag = exch_flags.get(exch, exch)
         n = len(rows)
+
+        # ── Header block ──────────────────────────────────────────────────────
+        emoji_line = "\U0001f7e2\U0001f7e2\U0001f7e2" if direction == "BULLISH" else "\U0001f534\U0001f534\U0001f534"  # 🟢🟢🟢 or 🔴🔴🔴
         lines = [
-            "<b>" + title + "</b>",
-            "\U0001f550 " + scan_time,
-            "\u23f1 " + tf_label + "  |  \U0001f4ca " + str(n) + " signal" + ("s" if n != 1 else ""),
-            _DIVIDER,
+            emoji_line,
+            _DIVIDER_THICK,
+            title + "  " + flag + " " + exch + "  |  \u23f1 " + tf_label,
+            "\U0001f4ca " + str(n) + " signal" + ("s" if n != 1 else "") + "  \U0001f550 " + scan_time,
+            _DIVIDER_THICK,
         ]
-        for r in rows[:20]:
-            lines.append(_fmt_breakout_row(r, arrow))
-            lines.append("")          # blank line between stocks for breathing room
+
+        # ── Stock cards ───────────────────────────────────────────────────────
+        for i, r in enumerate(rows[:20]):
+            if i > 0:
+                lines.append("")
+                lines.append(_DIVIDER_THIN)
+            lines.append("")
+
+            # ── Duplicate tag ──────────────────────────────────────────────
+            ticker   = r["ticker"]
+            total    = ticker_total.get(ticker, 1)
+            dirs     = ticker_dirs.get(ticker, set())
+            dup_tag  = ""
+            if len(dirs) > 1:
+                dup_tag = "  \u26a1 <b>BOTH DIRS</b>"
+            elif total > 1:
+                dup_tag = "  \u26a1 \u00d7{}".format(total)
+
+            lines.append(_fmt_breakout_row(r, arrow, dup_tag=dup_tag))
+
+        # ── Overflow notice ───────────────────────────────────────────────────
         if n > 20:
+            lines.append("")
+            lines.append(_DIVIDER_THIN)
             lines.append("\u2026 and {} more".format(n - 20))
+
+        lines.append("")
+        lines.append(_DIVIDER_THICK)
         _tg_send_block(lines)
 
 def tg_send_volume_spike_alerts(vol_spikes, tf_label, scan_time):
     """
-    Send 2 separate Telegram messages (one per exchange):
-      1. NSE  Volume Spikes
-      2. NYSE Volume Spikes
+    Send 4 separate Telegram messages (one per exchange × direction bucket):
+      1. NSE  Bullish (UP)   Volume Spikes
+      2. NSE  Bearish (DOWN) Volume Spikes
+      3. NYSE Bullish (UP)   Volume Spikes
+      4. NYSE Bearish (DOWN) Volume Spikes
 
-    Each message layout:
-      ┌─────────────────────────────────┐
-      │  🇮🇳 NSE ⚡ Volume Spikes        │  ← bold title
-      │  🕐 28 May 2026  20:40:12        │  ← scan time
-      │  ⏱ 1 Day  |  🔍 15 stocks ≥ 1.5x│  ← timeframe + count
-      │  ────────────────────────────   │  ← divider
-      │  ▲ TICKER   11.51x  ⚡ Breakout  │
-      │     Company Name                │
-      │     ₹Price  +X.XX%  📅 27 May   │
-      │  ▼ ...                          │
-      └─────────────────────────────────┘
+    Each message layout (nyse v5 style):
+      🟢🟢🟢
+      ━━━━━━━━━━━━━━━━━━━━━━
+      📗 BULLISH VOLUME SPIKES  🇮🇳 NSE  |  ⏱ 1 Day
+      🔍 8 stocks ≥ 1.5x  🕐 01 Jun 2026  14:30:00
+      ━━━━━━━━━━━━━━━━━━━━━━
+
+      🟢▲ TICKER — Company Name   🔥🔥 5.20x  ⚡ Breakout
+         ₹Price  📈+X.XX%  📅 01 Jun
+
+      ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+      ...
+      ━━━━━━━━━━━━━━━━━━━━━━
     """
     tg = _tg_cfg()
     if not tg:
@@ -335,26 +549,60 @@ def tg_send_volume_spike_alerts(vol_spikes, tf_label, scan_time):
     if not alerts_cfg.get("volume_spikes", True):
         return
 
-    min_ratio = float(alerts_cfg.get("min_vol_ratio", 1.5))
+    min_ratio     = float(alerts_cfg.get("min_vol_ratio", 1.5))
+    breakout_only = bool(alerts_cfg.get("only_breakout_spikes", False))
 
-    for exch, flag in [("NSE", "\U0001f1ee\U0001f1f3"), ("NYSE", "\U0001f1fa\U0001f1f8")]:
+    # ── Send order: NSE UP, NSE DOWN, NYSE UP, NYSE DOWN ─────────────────────
+    send_order = [
+        ("NSE",  "UP",   "\U0001f1ee\U0001f1f3"),   # 🇮🇳
+        ("NSE",  "DOWN", "\U0001f1ee\U0001f1f3"),
+        ("NYSE", "UP",   "\U0001f1fa\U0001f1f8"),   # 🇺🇸
+        ("NYSE", "DOWN", "\U0001f1fa\U0001f1f8"),
+    ]
+
+    for exch, direction, flag in send_order:
         rows = [s for s in vol_spikes
-                if s.get("exchange") == exch and s.get("vol_ratio", 0) >= min_ratio]
+                if s.get("exchange") == exch
+                and s.get("direction", "UP") == direction
+                and s.get("vol_ratio", 0) >= min_ratio
+                and (not breakout_only or s.get("has_breakout", False))]
         if not rows:
             continue
+
         n = len(rows)
+        bk_tag = "  \u26a1 Breakout only" if breakout_only else ""
+
+        if direction == "UP":
+            book_emoji  = "\U0001f4d7"           # 📗
+            header_name = "BULLISH VOLUME SPIKES"
+            lead_emoji  = "\U0001f7e2\U0001f7e2\U0001f7e2"   # 🟢🟢🟢
+        else:
+            book_emoji  = "\U0001f4d5"           # 📕
+            header_name = "BEARISH VOLUME SPIKES"
+            lead_emoji  = "\U0001f534\U0001f534\U0001f534"   # 🔴🔴🔴
+
         lines = [
-            "<b>" + flag + " " + exch + " \u26a1 Volume Spikes</b>",
-            "\U0001f550 " + scan_time,
-            "\u23f1 " + tf_label + "  |  \U0001f50d " + str(n) + " stock" + ("s" if n != 1 else "")
-                + " \u2265 " + "{:.1f}".format(min_ratio) + "x",
-            _DIVIDER,
+            lead_emoji,
+            _DIVIDER_THICK,
+            "{book} <b>{name}</b>  {flag} {exch}  |  \u23f1 {tf}{bk}".format(
+                book=book_emoji, name=header_name, flag=flag,
+                exch=exch, tf=tf_label, bk=bk_tag),
+            "\U0001f50d " + str(n) + " stock" + ("s" if n != 1 else "")
+                + " \u2265 " + "{:.1f}".format(min_ratio) + "x  \U0001f550 " + scan_time,
+            _DIVIDER_THICK,
         ]
-        for s in rows[:20]:
+        for i, s in enumerate(rows[:20]):
+            if i > 0:
+                lines.append("")
+                lines.append(_DIVIDER_THIN)
+            lines.append("")
             lines.append(_fmt_spike_row(s))
-            lines.append("")          # blank line between stocks
         if n > 20:
+            lines.append("")
+            lines.append(_DIVIDER_THIN)
             lines.append("\u2026 and {} more".format(n - 20))
+        lines.append("")
+        lines.append(_DIVIDER_THICK)
         _tg_send_block(lines)
 
 try:
@@ -482,99 +730,209 @@ NSE_STOCKS = [
 ]
 
 NYSE_STOCKS = [
-    # ── Technology (XLK) ──────────────────────────────────────────
-    ("NVDA",  "NVIDIA",                  950.02),
-    ("AAPL",  "Apple Inc",               213.49),
-    ("MSFT",  "Microsoft",               421.90),
-    ("GOOGL", "Alphabet (Class A)",      176.30),
-    ("GOOG",  "Alphabet (Class C)",      178.10),
-    ("META",  "Meta Platforms",          578.15),
-    ("AVGO",  "Broadcom",              1742.80),
-    ("MU",    "Micron Technology",        98.42),
-    ("ORCL",  "Oracle",                  128.74),
-    ("AMD",   "AMD",                     148.20),
-    ("CSCO",  "Cisco Systems",            49.82),
-    ("IBM",   "IBM",                     188.34),
-    ("INTC",  "Intel",                    21.48),
-    ("LRCX",  "Lam Research",            812.60),
-    ("AMAT",  "Applied Materials",       192.34),
-    ("PLTR",  "Palantir Technologies",    24.82),
-    ("AMZN",  "Amazon",                  202.40),
-    ("TSLA",  "Tesla",                   177.58),
-    # ── Financials (XLF) ──────────────────────────────────────────
-    ("BRK-B", "Berkshire Hathaway B",    412.30),
-    ("JPM",   "JPMorgan Chase",          244.82),
-    ("V",     "Visa",                    276.93),
-    ("MA",    "Mastercard",              489.25),
-    ("BAC",   "Bank of America",          44.21),
-    ("MS",    "Morgan Stanley",          108.42),
-    ("WFC",   "Wells Fargo",              62.18),
-    ("GS",    "Goldman Sachs",           482.60),
-    ("AXP",   "American Express",        242.80),
-    # ── Healthcare (XLV) ──────────────────────────────────────────
-    ("LLY",   "Eli Lilly",              812.40),
-    ("JNJ",   "Johnson & Johnson",       157.42),
-    ("ABBV",  "AbbVie",                 182.60),
-    ("MRK",   "Merck",                  128.34),
-    ("UNH",   "UnitedHealth Group",      512.80),
-    # ── Consumer Staples (XLP) ────────────────────────────────────
-    ("WMT",   "Walmart",                 100.12),
-    ("COST",  "Costco Wholesale",        892.40),
-    ("PG",    "Procter & Gamble",        171.08),
-    ("KO",    "Coca-Cola",               62.34),
-    ("PM",    "Philip Morris",           112.48),
-    ("PEP",   "PepsiCo",                172.60),
-    # ── Consumer Discretionary (XLY) ─────────────────────────────
-    ("HD",    "Home Depot",              342.50),
-    ("NFLX",  "Netflix",                 698.90),
-    ("MCD",   "McDonald's",              312.40),
-    # ── Energy (XLE) ──────────────────────────────────────────────
-    ("XOM",   "ExxonMobil",              111.56),
-    ("CVX",   "Chevron",                 152.34),
-    # ── Industrials (XLI) ─────────────────────────────────────────
-    ("CAT",   "Caterpillar",             382.60),
-    ("GE",    "GE Aerospace",            182.40),
-    ("RTX",   "RTX Corporation",         112.80),
-    ("GEV",   "GE Vernova",              312.60),
-    # ── Communication Services (XLC) ─────────────────────────────
-    ("TMUS",  "T-Mobile US",             212.40),
-    ("VZ",    "Verizon",                  42.18),
-    # ── Materials (XLB) ───────────────────────────────────────────
-    ("LIN",   "Linde",                   482.60),
-    # ── Others ───────────────────────────────────────────────────
-    ("DIS",   "Walt Disney",              96.40),
-    ("PYPL",  "PayPal",                   77.65),
+    # ── Technology (XLK) — 17 stocks ──────────────────────────────
+    ("NVDA",  "NVIDIA",                  135.00),
+    ("MSFT",  "Microsoft",               450.00),
+    ("AAPL",  "Apple Inc",               220.00),
+    ("AVGO",  "Broadcom",               1900.00),
+    ("AMD",   "AMD",                     170.00),
+    ("ORCL",  "Oracle",                  160.00),
+    ("ADBE",  "Adobe Inc",               420.00),
+    ("PANW",  "Palo Alto Networks",      380.00),
+    ("NOW",   "ServiceNow",              900.00),
+    ("SNPS",  "Synopsys",                530.00),
+    ("CRM",   "Salesforce",              320.00),
+    ("CSCO",  "Cisco Systems",            58.00),
+    ("INTC",  "Intel",                    22.00),
+    ("QCOM",  "Qualcomm",                165.00),
+    ("AMAT",  "Applied Materials",       210.00),
+    ("LRCX",  "Lam Research",            900.00),
+    ("SMCI",  "Super Micro Computer",     50.00),
+    # ── Communication Services (XLC) — 12 stocks ─────────────────
+    ("GOOGL", "Alphabet (Class A)",      185.00),
+    ("GOOG",  "Alphabet (Class C)",      186.00),
+    ("META",  "Meta Platforms",          610.00),
+    ("NFLX",  "Netflix",                 1000.00),
+    ("CMCSA", "Comcast",                  38.00),
+    ("DIS",   "Walt Disney",              95.00),
+    ("TMUS",  "T-Mobile US",             230.00),
+    ("VZ",    "Verizon",                  42.00),
+    ("T",     "AT&T",                     22.00),
+    ("CHTR",  "Charter Communications",  380.00),
+    ("SPOT",  "Spotify",                 600.00),
+    ("RBLX",  "Roblox",                   50.00),
+    # ── Consumer Discretionary (XLY) — 13 stocks ─────────────────
+    ("AMZN",  "Amazon",                  230.00),
+    ("TSLA",  "Tesla",                   340.00),
+    ("HD",    "Home Depot",              400.00),
+    ("MCD",   "McDonald's",              310.00),
+    ("TJX",   "TJX Companies",           125.00),
+    ("BKNG",  "Booking Holdings",       4800.00),
+    ("LOW",   "Lowe's",                  250.00),
+    ("SBUX",  "Starbucks",                82.00),
+    ("NKE",   "Nike",                     75.00),
+    ("MAR",   "Marriott International",  265.00),
+    ("ROST",  "Ross Stores",             155.00),
+    ("EBAY",  "eBay",                     62.00),
+    ("LULU",  "Lululemon Athletica",      320.00),
+    # ── Consumer Staples (XLP) — 10 stocks ───────────────────────
+    ("WMT",   "Walmart",                  98.00),
+    ("PG",    "Procter & Gamble",        175.00),
+    ("KO",    "Coca-Cola",                72.00),
+    ("PEP",   "PepsiCo",                 150.00),
+    ("COST",  "Costco Wholesale",        950.00),
+    ("PM",    "Philip Morris",           135.00),
+    ("MO",    "Altria Group",             55.00),
+    ("MDLZ",  "Mondelez International",   62.00),
+    ("CL",    "Colgate-Palmolive",        96.00),
+    ("MNST",  "Monster Beverage",         52.00),
+    # ── Health Care (XLV) — 16 stocks ────────────────────────────
+    ("LLY",   "Eli Lilly",               850.00),
+    ("UNH",   "UnitedHealth Group",      310.00),
+    ("JNJ",   "Johnson & Johnson",       160.00),
+    ("MRK",   "Merck",                   100.00),
+    ("ABBV",  "AbbVie",                  190.00),
+    ("TMO",   "Thermo Fisher Scientific",580.00),
+    ("AMGN",  "Amgen",                   290.00),
+    ("BMY",   "Bristol-Myers Squibb",     50.00),
+    ("GILD",  "Gilead Sciences",          90.00),
+    ("ISRG",  "Intuitive Surgical",      520.00),
+    ("VRTX",  "Vertex Pharmaceuticals",  480.00),
+    ("CVS",   "CVS Health",               65.00),
+    ("CI",    "Cigna Group",             320.00),
+    ("MDT",   "Medtronic",                85.00),
+    ("SYK",   "Stryker",                 380.00),
+    ("REGN",  "Regeneron Pharmaceuticals",780.00),
+    # ── Financials (XLF) — 18 stocks ─────────────────────────────
+    ("JPM",   "JPMorgan Chase",          270.00),
+    ("BAC",   "Bank of America",          44.00),
+    ("MS",    "Morgan Stanley",          120.00),
+    ("GS",    "Goldman Sachs",           600.00),
+    ("V",     "Visa",                    350.00),
+    ("MA",    "Mastercard",              550.00),
+    ("AXP",   "American Express",        290.00),
+    ("BLK",   "BlackRock",              1050.00),
+    ("SPGI",  "S&P Global",              500.00),
+    ("C",     "Citigroup",                65.00),
+    ("WFC",   "Wells Fargo",              75.00),
+    ("SCHW",  "Charles Schwab",           80.00),
+    ("COF",   "Capital One Financial",   200.00),
+    ("PGR",   "Progressive",             270.00),
+    ("CB",    "Chubb",                   310.00),
+    ("MMC",   "Marsh & McLennan",        230.00),
+    ("HOOD",  "Robinhood Markets",        50.00),
+    ("SOFI",  "SoFi Technologies",        14.00),
+    # ── Industrials (XLI) — 15 stocks ────────────────────────────
+    ("GE",    "GE Aerospace",            210.00),
+    ("CAT",   "Caterpillar",             380.00),
+    ("UNP",   "Union Pacific",           240.00),
+    ("HON",   "Honeywell",               220.00),
+    ("LMT",   "Lockheed Martin",         490.00),
+    ("UPS",   "United Parcel Service",   110.00),
+    ("RTX",   "RTX Corporation",         130.00),
+    ("DE",    "Deere & Company",         450.00),
+    ("FDX",   "FedEx",                   270.00),
+    ("BA",    "Boeing",                  200.00),
+    ("GEV",   "GE Vernova",              370.00),
+    ("ETN",   "Eaton",                   340.00),
+    ("ADP",   "Automatic Data Processing",290.00),
+    ("FAST",  "Fastenal",                 78.00),
+    ("CTAS",  "Cintas",                  200.00),
+    # ── Energy (XLE) — 12 stocks ─────────────────────────────────
+    ("XOM",   "ExxonMobil",              115.00),
+    ("CVX",   "Chevron",                 155.00),
+    ("COP",   "ConocoPhillips",          100.00),
+    ("NEE",   "NextEra Energy",           72.00),
+    ("SO",    "Southern Company",         88.00),
+    ("DUK",   "Duke Energy",              115.00),
+    ("CEG",   "Constellation Energy",    250.00),
+    ("VST",   "Vistra",                  140.00),
+    ("SLB",   "SLB (Schlumberger)",       40.00),
+    ("EOG",   "EOG Resources",           130.00),
+    ("KMI",   "Kinder Morgan",            24.00),
+    ("PSX",   "Phillips 66",             130.00),
+    # ── Materials (XLB) — 8 stocks ───────────────────────────────
+    ("LIN",   "Linde",                   500.00),
+    ("FCX",   "Freeport-McMoRan",         42.00),
+    ("SHW",   "Sherwin-Williams",         360.00),
+    ("NEM",   "Newmont",                  52.00),
+    ("APD",   "Air Products & Chemicals", 320.00),
+    ("ECL",   "Ecolab",                  240.00),
+    ("NUE",   "Nucor",                   150.00),
+    ("DOW",   "Dow Inc",                  36.00),
+    # ── Real Estate (XLRE) — 10 stocks ───────────────────────────
+    ("PLD",   "Prologis",                110.00),
+    ("AMT",   "American Tower",          195.00),
+    ("EQIX",  "Equinix",                 860.00),
+    ("DLR",   "Digital Realty Trust",    165.00),
+    ("WELL",  "Welltower",               130.00),
+    ("SPG",   "Simon Property Group",    175.00),
+    ("PSA",   "Public Storage",          290.00),
+    ("O",     "Realty Income",            56.00),
+    ("CBRE",  "CBRE Group",              115.00),
+    ("VTR",   "Ventas",                   62.00),
+    # ── Utilities (XLU) — 7 stocks ───────────────────────────────
+    ("EXC",   "Exelon",                   42.00),
+    ("XEL",   "Xcel Energy",              72.00),
+    ("AEP",   "American Electric Power",  110.00),
+    ("SRE",   "Sempra",                   72.00),
+    ("D",     "Dominion Energy",           18.00),
+    ("PEG",   "Public Service Enterprise", 90.00),
+    ("WEC",   "WEC Energy Group",          90.00),
 ]
 
 # ── Sector Maps ───────────────────────────────────────────────────────────────
 USA_SECTOR_MAP = {
+    # Technology (XLK) — 17
     **{s: "XLK" for s in [
-        "NVDA","AAPL","MSFT","GOOGL","GOOG","META","AVGO","MU","ORCL",
-        "AMD","CSCO","IBM","INTC","LRCX","AMAT","PLTR","AMZN","TSLA",
+        "NVDA","MSFT","AAPL","AVGO","AMD","ORCL","ADBE","PANW",
+        "NOW","SNPS","CRM","CSCO","INTC","QCOM","AMAT","LRCX","SMCI",
     ]},
-    **{s: "XLF" for s in [
-        "BRK-B","JPM","V","MA","BAC","MS","WFC","GS","AXP",
-    ]},
-    **{s: "XLV" for s in [
-        "LLY","JNJ","ABBV","MRK","UNH",
-    ]},
-    **{s: "XLP" for s in [
-        "WMT","COST","PG","KO","PM","PEP",
-    ]},
-    **{s: "XLY" for s in [
-        "HD","NFLX","MCD",
-    ]},
-    **{s: "XLE" for s in [
-        "XOM","CVX",
-    ]},
-    **{s: "XLI" for s in [
-        "CAT","GE","RTX","GEV",
-    ]},
+    # Communication Services (XLC) — 12
     **{s: "XLC" for s in [
-        "TMUS","VZ",
+        "GOOGL","GOOG","META","NFLX","CMCSA","DIS",
+        "TMUS","VZ","T","CHTR","SPOT","RBLX",
     ]},
+    # Consumer Discretionary (XLY) — 13
+    **{s: "XLY" for s in [
+        "AMZN","TSLA","HD","MCD","TJX","BKNG",
+        "LOW","SBUX","NKE","MAR","ROST","EBAY","LULU",
+    ]},
+    # Consumer Staples (XLP) — 10
+    **{s: "XLP" for s in [
+        "WMT","PG","KO","PEP","COST","PM","MO","MDLZ","CL","MNST",
+    ]},
+    # Health Care (XLV) — 16
+    **{s: "XLV" for s in [
+        "LLY","UNH","JNJ","MRK","ABBV","TMO","AMGN","BMY",
+        "GILD","ISRG","VRTX","CVS","CI","MDT","SYK","REGN",
+    ]},
+    # Financials (XLF) — 18
+    **{s: "XLF" for s in [
+        "JPM","BAC","MS","GS","V","MA","AXP","BLK",
+        "SPGI","C","WFC","SCHW","COF","PGR","CB","MMC","HOOD","SOFI",
+    ]},
+    # Industrials (XLI) — 15
+    **{s: "XLI" for s in [
+        "GE","CAT","UNP","HON","LMT","UPS","RTX","DE",
+        "FDX","BA","GEV","ETN","ADP","FAST","CTAS",
+    ]},
+    # Energy (XLE) — 12
+    **{s: "XLE" for s in [
+        "XOM","CVX","COP","NEE","SO","DUK","CEG","VST",
+        "SLB","EOG","KMI","PSX",
+    ]},
+    # Materials (XLB) — 8
     **{s: "XLB" for s in [
-        "LIN",
+        "LIN","FCX","SHW","NEM","APD","ECL","NUE","DOW",
+    ]},
+    # Real Estate (XLRE) — 10
+    **{s: "XLRE" for s in [
+        "PLD","AMT","EQIX","DLR","WELL","SPG","PSA","O","CBRE","VTR",
+    ]},
+    # Utilities (XLU) — 7
+    **{s: "XLU" for s in [
+        "EXC","XEL","AEP","SRE","D","PEG","WEC",
     ]},
 }
 
@@ -829,6 +1187,112 @@ def find_pivots(series, order=5):
         if arr[i] == w.max(): highs.append((i, float(arr[i])))
         if arr[i] == w.min(): lows.append((i, float(arr[i])))
     return highs, lows
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  SUPPORT & RESISTANCE  (proximity-first, timeframe-aware)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def calculate_sr(df: pd.DataFrame) -> dict:
+    """
+    Calculate S1 (nearest support) and R1 (nearest resistance) from recent
+    swing highs/lows.  Adapts settings based on ACTIVE_TIMEFRAME so the same
+    function works correctly across 15m / 1h / 4h / 1d scans.
+
+    Settings per timeframe:
+      15m : lb=5,  recent=80 bars,  tol=0.3%, cap=2.5%, fallback=1.0%
+      1h  : lb=6,  recent=100 bars, tol=0.5%, cap=4.0%, fallback=1.5%
+      4h  : lb=7,  recent=90 bars,  tol=0.8%, cap=6.0%, fallback=2.5%
+      1d  : lb=8,  recent=60 bars,  tol=1.2%, cap=8.0%, fallback=3.0%
+
+    Returns:
+        {"s1": float, "r1": float, "pivot": float}
+    All values are 0.0 on failure.
+    """
+    try:
+        close = df["Close"].values
+        high  = df["High"].values
+        low   = df["Low"].values
+        n     = len(df)
+        if n < 20:
+            return {"s1": 0.0, "r1": 0.0, "pivot": 0.0}
+
+        current_price = float(close[-1])
+
+        # ── Per-timeframe settings ──────────────────────────────────────────
+        tf_sr_settings = {
+            "15m": {"lb": 5, "recent": 80,  "tol": 0.003, "max_pct": 0.025, "fb_pct": 0.010},
+            "1h":  {"lb": 6, "recent": 100, "tol": 0.005, "max_pct": 0.040, "fb_pct": 0.015},
+            "4h":  {"lb": 7, "recent": 90,  "tol": 0.008, "max_pct": 0.060, "fb_pct": 0.025},
+            "1d":  {"lb": 8, "recent": 60,  "tol": 0.012, "max_pct": 0.080, "fb_pct": 0.030},
+        }
+        cfg     = tf_sr_settings.get(ACTIVE_TIMEFRAME, tf_sr_settings["1d"])
+        lb      = cfg["lb"]
+        recent  = min(cfg["recent"], n)
+        tol     = cfg["tol"]
+        max_pct = cfg["max_pct"]
+        fb_pct  = cfg["fb_pct"]
+
+        h  = high[-recent:]
+        l  = low[-recent:]
+        nr = len(h)
+
+        swing_highs: list = []
+        swing_lows:  list = []
+
+        for i in range(lb, nr - lb):
+            recency_w = 1.0 + (i / nr)
+            if h[i] == max(h[i - lb: i + lb + 1]):
+                swing_highs.append((float(h[i]), recency_w))
+            if l[i] == min(l[i - lb: i + lb + 1]):
+                swing_lows.append((float(l[i]),  recency_w))
+
+        def cluster_levels(swings, tolerance):
+            if not swings:
+                return []
+            swings = sorted(swings, key=lambda x: x[0])
+            clusters = [[swings[0]]]
+            for price, w in swings[1:]:
+                ref = clusters[-1][0][0]   # anchor to first in cluster
+                if (price - ref) / ref < tolerance:
+                    clusters[-1].append((price, w))
+                else:
+                    clusters.append([(price, w)])
+            centres = []
+            for grp in clusters:
+                total_w = sum(ww for _, ww in grp)
+                centres.append(round(sum(p * ww for p, ww in grp) / total_w, 2))
+            centres.sort(key=lambda x: abs(x - current_price))
+            return centres
+
+        all_res = cluster_levels(
+            [(p, w) for p, w in swing_highs if p > current_price * 1.001], tol
+        )
+        all_sup = cluster_levels(
+            [(p, w) for p, w in swing_lows  if p < current_price * 0.999], tol
+        )
+
+        cap = current_price * max_pct
+
+        # R1 — nearest resistance within cap, else fallback
+        r1 = next((lvl for lvl in all_res if abs(lvl - current_price) <= cap),
+                  round(current_price * (1 + fb_pct), 2))
+
+        # S1 — nearest support within cap, else fallback
+        s1 = next((lvl for lvl in all_sup if abs(lvl - current_price) <= cap),
+                  round(current_price * (1 - fb_pct), 2))
+
+        # Pivot: previous bar HLC/3
+        pb = -2 if n >= 2 else -1
+        pivot = round(
+            (float(high[pb]) + float(low[pb]) + float(close[pb])) / 3, 2
+        )
+
+        return {"s1": s1, "r1": r1, "pivot": pivot}
+
+    except Exception as e:
+        logging.debug(f"calculate_sr failed: {e}")
+        return {"s1": 0.0, "r1": 0.0, "pivot": 0.0}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1431,18 +1895,50 @@ def scan_stock(ticker, name, base_price, idx, exchange, live=True):
     avg_vol = int(df["Volume"].tail(20).mean())
     vol_ratio = round(vol / max(avg_vol, 1), 1)
     vol_confirmed = vol > avg_vol * 1.5
+    # Upgraded vol_ok flag (same threshold as nyse scanner)
+    vol_ok_new    = vol_ratio >= 1.5
+
     rsi = calc_rsi(df)
     sector_rsi_val, sector_code = get_sector_rsi_for_ticker(ticker, exchange)
+
+    # ── EMA slope bias (bullish / bearish / neutral) ──────────────────────────
+    def _ema_slope_bias(df_):
+        c = df_["Close"]
+        if len(c) < 55:
+            return "neutral"
+        ema20 = c.ewm(span=20, adjust=False).mean()
+        ema50 = c.ewm(span=50, adjust=False).mean()
+        e20_now, e20_prev = float(ema20.iloc[-1]), float(ema20.iloc[-6])
+        e50_now, e50_prev = float(ema50.iloc[-1]), float(ema50.iloc[-6])
+        above = e20_now > e50_now
+        if above and e20_now > e20_prev and e50_now > e50_prev:
+            return "bullish"
+        if not above and e20_now < e20_prev and e50_now < e50_prev:
+            return "bearish"
+        return "neutral"
+
+    trend_bias = _ema_slope_bias(df)
+
+    # ── S1 / R1 (proximity-first swing-based levels, timeframe-aware) ─────────
+    sr = calculate_sr(df)
 
     base_info = {
         "ticker": ticker, "name": name, "exchange": exchange,
         "price": round(cur, 2), "change": pct,
         "volume": vol, "vol_ratio": vol_ratio,
         "vol_confirmed": vol_confirmed,
+        "vol_ok": vol_ok_new,
         "sector": get_sector(ticker, exchange),
         "sector_code": sector_code or "—",
         "rsi": rsi,
         "sector_rsi": sector_rsi_val,
+        "trend_bias": trend_bias,
+        "s1": sr["s1"],
+        "r1": sr["r1"],
+        "pivot": sr["pivot"],
+        # default tier/quality (no anti-fakeout engine in this file, set safe defaults)
+        "tier": "early",
+        "quality": "",
     }
 
     results = []
@@ -1478,8 +1974,26 @@ def scan_stock(ticker, name, base_price, idx, exchange, live=True):
     except Exception as e:
         logging.debug(f"[{ticker}] check_ema_dynamic failed: {e}")
 
+    # ── Simple quality score (0–100) based on vol + trend alignment ───────────
+    for r in results:
+        score = 0
+        bias = r.get("trend_bias", "neutral")
+        sig  = r.get("signal", "BULLISH")
+        if (sig == "BULLISH" and bias == "bullish") or (sig == "BEARISH" and bias == "bearish"):
+            score += 40
+        elif bias == "neutral":
+            score += 15
+        vr = float(r.get("vol_ratio", 1.0))
+        score += min(int((vr - 1.0) / 2.0 * 35), 35)
+        if r.get("vol_ok"):
+            score += 25
+        r["quality"] = round(min(score, 100), 1)
+
     # FIX-10: Deduplicate — max MAX_PER_DIRECTION signals per direction
     results = deduplicate_signals(results)
+
+    # Sort by quality descending so best setups surface first
+    results.sort(key=lambda x: -float(x.get("quality", 0)))
 
     return results
 
@@ -1637,6 +2151,8 @@ tbody td{padding:8px 11px;vertical-align:middle}
   text-overflow:ellipsis;max-width:270px;display:block}
 .dtxt:hover{white-space:normal;overflow:visible;color:var(--mu)}
 .clvl{font-family:var(--mono);font-size:11px;color:var(--dim);text-align:right}
+.cs1{font-family:var(--mono);font-size:11px;color:var(--bull);text-align:right;white-space:nowrap}
+.cr1{font-family:var(--mono);font-size:11px;color:var(--bear);text-align:right;white-space:nowrap}
 
 /* ── EXCHANGE BADGES — flag colours ── */
 .exch-badge{display:inline-flex;align-items:center;gap:4px;font-size:10px;font-weight:700;
@@ -1938,6 +2454,8 @@ footer a{color:var(--acc);text-decoration:none}
       <th onclick="sortBy('num')">TL Type <span class="sa">&#8597;</span></th>
       <th>Signal Detail</th>
       <th onclick="sortBy('tl')" style="text-align:right">TL Level <span class="sa">&#8597;</span></th>
+      <th onclick="sortBy('s1')" style="text-align:right;color:var(--bull)">🟢 S1 <span class="sa">&#8597;</span></th>
+      <th onclick="sortBy('r1')" style="text-align:right;color:var(--bear)">🔴 R1 <span class="sa">&#8597;</span></th>
     </tr>
   </thead>
   <tbody id="tbl-body"></tbody>
@@ -2207,7 +2725,7 @@ function render(){
 
   var tbody=document.getElementById('tbl-body');
   if(!data.length){
-    tbody.innerHTML='<tr class="empty-row"><td colspan="13">No signals match the current filters.</td></tr>';
+    tbody.innerHTML='<tr class="empty-row"><td colspan="15">No signals match the current filters.</td></tr>';
     return;
   }
 
@@ -2240,6 +2758,8 @@ function render(){
       +'<td class="ctln"><span class="tnum">#'+r.num+'</span><span class="tname">'+(TL_NAMES[r.num]||'')+'</span></td>'
       +'<td class="cdet"><span class="dtxt" title="'+r.type+' \u2014 '+r.detail+'">'+r.type+' \u2014 '+r.detail+'</span></td>'
       +'<td class="clvl">'+fmtP(r.tl,r.exchange)+'</td>'
+      +'<td class="cs1">'+(r.s1?fmtP(r.s1,r.exchange):'—')+'</td>'
+      +'<td class="cr1">'+(r.r1?fmtP(r.r1,r.exchange):'—')+'</td>'
       +'</tr>';
   });
   tbody.innerHTML=html;
@@ -2293,7 +2813,7 @@ function sortBy(col){
     th.classList.remove('sorted');
     var sa=th.querySelector('.sa');if(sa)sa.innerHTML='&#8597;';
   });
-  var cols=['ticker','name','sector','exchange','price','change','signal','rsi','srsi','vol_ratio','num','','tl'];
+  var cols=['ticker','name','sector','exchange','price','change','signal','rsi','srsi','vol_ratio','num','','tl','s1','r1'];
   var idx=cols.indexOf(col);
   if(idx>=0){
     var th=document.querySelectorAll('thead th')[idx];
@@ -2403,10 +2923,14 @@ function renderVsTab(){
 
   var sigOnly = document.getElementById('vs-sig-only').checked;
 
+  // FIX: sanitize NaN numeric fields so JS .toFixed() never throws
+  function safeNum(v, fallback){ var n=parseFloat(v); return isNaN(n)?fallback:n; }
+
   var data = VS_DATA.filter(function(r){
     if(VS.exch !== 'ALL' && r.exchange !== VS.exch) return false;
     if(VS.dir  !== 'ALL' && r.direction !== VS.dir) return false;
-    if(r.vol_ratio < ratioMin) return false;
+    var vr = safeNum(r.vol_ratio, 0);
+    if(vr < ratioMin) return false;
     if(sigOnly && !r.has_breakout) return false;
     return true;
   });
@@ -2431,11 +2955,16 @@ function renderVsTab(){
   var html='';
   data.forEach(function(r){
     var isUp   = r.direction === 'UP';
-    var chgCls = r.candle_chg >= 0 ? 'up' : 'dn';
-    var chgSign= r.candle_chg >= 0 ? '+' : '';
+    var chg_safe   = safeNum(r.candle_chg,   0);
+    var body_safe  = safeNum(r.candle_body,  0);
+    var range_safe = safeNum(r.candle_range, 0);
+    var ratio_safe = safeNum(r.vol_ratio,    0);
+    var price_safe = safeNum(r.price,        0);
+    var chgCls = chg_safe >= 0 ? 'up' : 'dn';
+    var chgSign= chg_safe >= 0 ? '+' : '';
     var exchCls= r.exchange==='NSE'?'exch-nse':'exch-nyse';
     var exchFlag=r.exchange==='NSE'?'&#127470;&#127475;':'&#127482;&#127480;';
-    var ratioColor = r.vol_ratio>=5 ? '#ff4c5b' : r.vol_ratio>=3 ? '#f5c842' : r.vol_ratio>=2 ? '#00d17a' : 'var(--mu)';
+    var ratioColor = ratio_safe>=5 ? '#ff4c5b' : ratio_safe>=3 ? '#f5c842' : ratio_safe>=2 ? '#00d17a' : 'var(--mu)';
     var dirBadge = isUp
       ? '<span style="color:var(--bull);font-family:var(--mono);font-size:10px;font-weight:700">&#9650; UP</span>'
       : '<span style="color:var(--bear);font-family:var(--mono);font-size:10px;font-weight:700">&#9660; DOWN</span>';
@@ -2448,11 +2977,11 @@ function renderVsTab(){
       +'<td class="cn" title="'+r.name+'">'+r.name+'</td>'
       +'<td class="cs"><span class="'+sectZoneCls(r.sector)+'">'+r.sector+'</span></td>'
       +'<td><span class="exch-badge '+exchCls+'">'+exchFlag+' '+r.exchange+'</span></td>'
-      +'<td class="cp">'+fmtP(r.price, r.exchange)+'</td>'
-      +'<td class="cc '+chgCls+'" style="text-align:right">'+chgSign+r.candle_chg.toFixed(2)+'%</td>'
-      +'<td style="text-align:right;font-family:var(--mono);color:var(--mu)">'+r.candle_body.toFixed(2)+'%</td>'
-      +'<td style="text-align:right;font-family:var(--mono);color:var(--dim)">'+r.candle_range.toFixed(2)+'%</td>'
-      +'<td style="text-align:right;font-family:var(--mono);font-weight:700;font-size:14px;color:'+ratioColor+'">'+r.vol_ratio.toFixed(2)+'x</td>'
+      +'<td class="cp">'+fmtP(price_safe, r.exchange)+'</td>'
+      +'<td class="cc '+chgCls+'" style="text-align:right">'+chgSign+chg_safe.toFixed(2)+'%</td>'
+      +'<td style="text-align:right;font-family:var(--mono);color:var(--mu)">'+body_safe.toFixed(2)+'%</td>'
+      +'<td style="text-align:right;font-family:var(--mono);color:var(--dim)">'+range_safe.toFixed(2)+'%</td>'
+      +'<td style="text-align:right;font-family:var(--mono);font-weight:700;font-size:14px;color:'+ratioColor+'">'+ratio_safe.toFixed(2)+'x</td>'
       +'<td style="text-align:right;font-family:var(--mono);color:var(--mu)">'+fmtVol(r.cur_vol)+'</td>'
       +'<td style="text-align:right;font-family:var(--mono);color:var(--dim)">'+fmtVol(r.avg_vol)+'</td>'
       +'<td>'+brkCell+'</td>'
@@ -2629,6 +3158,12 @@ def detect_volume_spikes(all_stocks_data):
             candle_range= round((cur_high - cur_low) / prev_close * 100, 2) if prev_close else 0
             direction   = "UP" if cur_close >= cur_open else "DOWN"
 
+            # FIX: skip entries where yfinance returned NaN for price fields
+            import math as _math
+            if any(_math.isnan(v) for v in [cur_close, cur_open, candle_chg, candle_body, candle_range, vol_ratio]):
+                logging.debug(f"[{ticker}] vol spike skipped: NaN in OHLCV fields")
+                continue
+
             # Check if this ticker has any trendline breakout signal in all_results
             tl_signals  = []  # will be filled in generate_html
 
@@ -2645,7 +3180,6 @@ def detect_volume_spikes(all_stocks_data):
                 "cur_vol":      int(cur_vol),
                 "avg_vol":      int(avg_vol),
                 "vol_ratio":    vol_ratio,
-                "vol_ok":       vol_ratio >= 1.5,  # FIX: was missing — used by vol-confirmed filter
                 "candle_time":  candle_time_str,   # date+time of the spike candle
                 "has_breakout": False,   # patched in generate_html
                 "breakout_signals": [],  # patched in generate_html
@@ -2672,23 +3206,29 @@ def generate_html(results, scan_time, tf_label="1 Day", vol_spikes=None):
         srsi_raw = r.get("sector_rsi")
         srsi_lbl, _ = rsi_zone(srsi_raw)
         return {
-            "ticker":    r["ticker"],
-            "name":      r["name"],
-            "sector":    r.get("sector", "—"),
-            "exchange":  r["exchange"],
-            "num":       r.get("num", "?"),
-            "type":      r["type"],
-            "signal":    r["signal"],
-            "price":     r["price"],
-            "change":    r["change"],
-            "vol_ratio": r.get("vol_ratio", 0),
-            "vol_ok":    bool(r.get("vol_confirmed")),
-            "rsi":       rsi_raw if rsi_raw is not None else "",
-            "rsi_zone":  zone_lbl,
-            "srsi":      srsi_raw if srsi_raw is not None else "",
-            "srsi_zone": srsi_lbl,
-            "tl":        r["tl"],
-            "detail":    r["detail"],
+            "ticker":      r["ticker"],
+            "name":        r["name"],
+            "sector":      r.get("sector", "—"),
+            "exchange":    r["exchange"],
+            "num":         r.get("num", "?"),
+            "type":        r["type"],
+            "signal":      r["signal"],
+            "price":       r["price"],
+            "change":      r["change"],
+            "vol_ratio":   r.get("vol_ratio", 0),
+            "vol_ok":      bool(r.get("vol_ok", r.get("vol_confirmed", False))),
+            "rsi":         rsi_raw if rsi_raw is not None else "",
+            "rsi_zone":    zone_lbl,
+            "srsi":        srsi_raw if srsi_raw is not None else "",
+            "srsi_zone":   srsi_lbl,
+            "tl":          r["tl"],
+            "detail":      r["detail"],
+            "s1":          r.get("s1", 0.0),
+            "r1":          r.get("r1", 0.0),
+            "pivot":       r.get("pivot", 0.0),
+            "trend_bias":  r.get("trend_bias", "neutral"),
+            "tier":        r.get("tier", "early"),
+            "quality":     r.get("quality", ""),
         }
 
     nse_json  = _json.dumps([row_to_dict(r) for r in nse],  ensure_ascii=False)
@@ -2789,7 +3329,7 @@ def run_single_timeframe(tf, nse_to_scan, nyse_to_scan, scan_time, force=False):
     out_path    = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                f"trendline_breakout_{tf}_report.html")
 
-    print(f"\n  ── Timeframe: {tf_label} ─────────────────────────────────────────")
+    print(f"\n  ── Timeframe: {tf_label} ({'--force' if force else 'normal'}) ─────────────────")
 
     all_results = []
     done = 0
@@ -2815,10 +3355,9 @@ def run_single_timeframe(tf, nse_to_scan, nyse_to_scan, scan_time, force=False):
 
     # Volume spikes
     print(f"    Building volume spike tracker…", end="", flush=True)
-    # FIX: always use full stock universe for vol spikes — never empty regardless of market hours
     all_stocks_live = (
-        [(t, n, p, i, "NSE",  True) for i,(t,n,p) in enumerate(NSE_STOCKS)] +
-        [(t, n, p, i, "NYSE", True) for i,(t,n,p) in enumerate(NYSE_STOCKS)]
+        [(t, n, p, i, "NSE",  True) for i,(t,n,p) in enumerate(nse_to_scan)] +
+        [(t, n, p, i, "NYSE", True) for i,(t,n,p) in enumerate(nyse_to_scan)]
     )
     vol_spikes = detect_volume_spikes(all_stocks_live)
     print(f" {len(vol_spikes)} stocks tracked")
@@ -2929,7 +3468,12 @@ def main():
             "        plus a combined index.html linking them all  (default: 1d)"
         )
     )
-    # --force flag removed: time restriction is disabled; scanner always runs both exchanges
+    parser.add_argument(
+        "--force", "-f",
+        action="store_true",
+        default=True,
+        help="Skip freshness check and market-hours gate — always run a full scan (default: True)"
+    )
     args = parser.parse_args()
 
     scan_time = datetime.now().strftime("%d %b %Y  %H:%M:%S")
@@ -2937,13 +3481,31 @@ def main():
     print(f"\nTrendBreak Pro v3  ·  {len(NSE_STOCKS)+len(NYSE_STOCKS)} stocks  ·  20 trendline types  ·  {scan_time}")
     print(f"  16 fixes applied — see file header for changelog")
 
-    # ── Market-hours gate REMOVED — always scan both NSE + NYSE ─────────────────
-    # Time restriction removed: scanner runs anytime on GitHub Actions or locally.
-    print(f"  ✅  Scanning NSE  → {len(NSE_STOCKS)} stocks")
-    print(f"  ✅  Scanning NYSE → {len(NYSE_STOCKS)} stocks\n")
+    # ── Market-hours gate: decide which exchanges to scan ──────────────────────
+    nse_open, nyse_open = market_status()
 
-    nse_to_scan  = NSE_STOCKS
-    nyse_to_scan = NYSE_STOCKS
+    if args.force:
+        nse_open = nyse_open = True
+        print("  ⚡  --force flag set — scanning both NSE + NYSE regardless of market hours\n")
+    else:
+        if not nse_open and not nyse_open:
+            print("  ⏸  Both NSE and NYSE are currently closed — nothing to scan.")
+            print("     NSE  : Mon–Fri  09:15–15:30 IST")
+            print("     NYSE : Mon–Fri  09:00–19:00 ET")
+            print("     Run with --force to scan anyway.\n")
+            sys.exit(0)
+        if nse_open:
+            print(f"  ✅  NSE is OPEN  (09:15–15:30 IST) → scanning {len(NSE_STOCKS)} NSE stocks")
+        else:
+            print(f"  🔒  NSE is CLOSED → skipping NSE stocks entirely")
+        if nyse_open:
+            print(f"  ✅  NYSE is OPEN (09:00–19:00 ET)  → scanning {len(NYSE_STOCKS)} NYSE stocks")
+        else:
+            print(f"  🔒  NYSE is CLOSED → skipping NYSE stocks entirely")
+        print()
+
+    nse_to_scan  = NSE_STOCKS  if nse_open  else []
+    nyse_to_scan = NYSE_STOCKS if nyse_open else []
 
     # ── Decide which timeframes to run ────────────────────────────────────────
     if args.timeframe == "all":
@@ -2959,7 +3521,7 @@ def main():
 
     for tf in timeframes_to_run:
         all_results, vol_spikes, out_path, tf_label = run_single_timeframe(
-            tf, nse_to_scan, nyse_to_scan, scan_time, force=True
+            tf, nse_to_scan, nyse_to_scan, scan_time, force=args.force
         )
         bull  = [r for r in all_results if r["signal"] == "BULLISH"]
         bear  = [r for r in all_results if r["signal"] == "BEARISH"]
